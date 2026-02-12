@@ -1,0 +1,105 @@
+name: Build, Test and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        id: python-setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Load cached Poetry installation
+        id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: poetry-0
+
+      - name: Install and configure Poetry
+        if: steps.poetry-cache.outputs.cache-hit != 'true'
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-in-project: true
+
+      - name: Load cached venv
+        id: dependencies-cache
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.python-setup.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        if: steps.dependencies-cache.outputs.cache-hit != 'true'
+        run: |
+          poetry install  --no-interaction --no-root
+
+      # TODO: add linting / black / flake8
+      # - name: Lint with flake8
+      #   run: |
+      #     source .venv/bin/activate
+      #     # stop the build if there are Python syntax errors or undefined names
+      #     flake8 ./evaluation_function --count --select=E9,F63,F7,F82 --show-source --statistics
+      #     # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+      #     flake8 ./evaluation_function --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run tests
+        if: always()
+        run: |
+          source .venv/bin/activate
+          pytest --junit-xml=./reports/pytest.xml --tb=auto -v
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: ./reports/pytest.xml
+          if-no-files-found: warn
+
+  build:
+    name: Build Docker Image
+    uses: lambda-feedback/evaluation-function-workflows/.github/workflows/build.yml@main
+    needs: test
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+
+  deploy:
+    name: Deploy to Lambda Feedback
+    uses: lambda-feedback/evaluation-function-workflows/.github/workflows/deploy.yml@main
+    needs: test
+    with:
+      template-repository-name: "lambda-feedback/evaluation-function-boilerplate-python"
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    secrets:
+      aws-key-id: ${{ secrets.LAMBDA_CONTAINER_PIPELINE_AWS_ID }}
+      aws-secret-key: ${{ secrets.LAMBDA_CONTAINER_PIPELINE_AWS_SECRET}}
+      function-admin-api-key: ${{ secrets.FUNCTION_ADMIN_API_KEY}}
