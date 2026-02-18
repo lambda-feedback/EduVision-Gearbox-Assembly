@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+#from ultralytics import YOLO
+YOLO = None
 
 
 # =========================
