@@ -19,7 +19,15 @@ except Exception:
     class ImageUploadError(Exception):  # type: ignore
         pass
 
-from .yolo_pipeline import run_yolo_pipeline
+PIPELINE_IMPORT_ERROR = None
+run_yolo_pipeline = None
+
+try:
+    from .yolo_pipeline import run_yolo_pipeline  # type: ignore
+except Exception as e:
+    PIPELINE_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    run_yolo_pipeline = None
+#from .yolo_pipeline import run_yolo_pipeline
 
 
 # URL / path helpers
@@ -105,7 +113,16 @@ def _items_to_feedback_html(items):
 # Main entry
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     try:
-        # Validate input
+        # 0) Pipeline import guard (MOST IMPORTANT)
+        if run_yolo_pipeline is None:
+            items = [("Error", f"Pipeline import failed: {PIPELINE_IMPORT_ERROR}")]
+            feedback_html = _items_to_feedback_html(items)
+            try:
+                return Result(is_correct=False, feedback=feedback_html, feedback_items=items)
+            except TypeError:
+                return Result(is_correct=False, feedback_items=items)
+        # 1) Validate input
+
         if not isinstance(response, list) or len(response) == 0:
             items = [("Response", "Please upload at least one image.")]
             feedback_html = _items_to_feedback_html(items)
@@ -113,31 +130,23 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 return Result(is_correct=False, feedback=feedback_html, feedback_items=items)
             except TypeError:
                 return Result(is_correct=False, feedback_items=items)
+        # 2) Optional controls
 
-        # Optional controls (safe defaults)
-        # Default: NO image upload (text only), to match your current goal
         return_images: bool = bool(_pget(params, "return_images", False))
         debug: bool = bool(_pget(params, "debug", False))
 
-        # Relative model filenames stored in evaluation_function/
         gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
         shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
-
-
-        # Process images
+        # 3) Process images
         merged_errors: List[Dict[str, str]] = []
         merged_summaries: List[Dict[str, Any]] = []
         merged_ratios: List[Dict[str, Any]] = []
-
         feedback_items: List[Tuple[str, str]] = []
 
         for idx, item in enumerate(response):
             url = item.get("url") if isinstance(item, dict) else None
             if not url:
-                merged_errors.append({
-                    "code": "NO_URL",
-                    "message": f"Image [{idx}] has no 'url' field."
-                })
+                merged_errors.append({"code": "NO_URL", "message": f"Image [{idx}] has no 'url' field."})
                 continue
 
             img_bgr, err = _load_bgr_image_from_url(url)
@@ -150,13 +159,22 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     feedback_items.append((f"Input URL [{idx}]", str(url)))
                 continue
 
-            # Run pipeline (your external YOLO pipeline)
-            out = run_yolo_pipeline(
-                img_bgr=img_bgr,
-                gear_model_rel=gear_model_rel,
-                shaft_model_rel=shaft_model_rel,
-                return_images=return_images,
-            )
+            # ---- Run YOLO pipeline safely per-image ----
+            try:
+                out = run_yolo_pipeline(
+                    img_bgr=img_bgr,
+                    gear_model_rel=gear_model_rel,
+                    shaft_model_rel=shaft_model_rel,
+                    return_images=return_images,
+                )
+            except Exception as e:
+                merged_errors.append({
+                    "code": "PIPELINE_RUNTIME_FAIL",
+                    "message": f"Pipeline failed on image[{idx}]: {type(e).__name__}: {e}"
+                })
+                if debug:
+                    feedback_items.append((f"Input URL [{idx}]", str(url)))
+                continue
 
             # Collect outputs safely
             summary = out.get("summary", {})
@@ -170,7 +188,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             if isinstance(errors, list):
                 merged_errors.extend(errors)
 
-            # Optional annotated images upload (disabled by default)
+            # Optional annotated images upload (off by default)
             if return_images:
                 imgs = out.get("images", None)
                 if isinstance(imgs, dict) and upload_image is not None:
@@ -198,12 +216,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             if debug:
                 feedback_items.append((f"Input URL [{idx}]", str(url)))
 
-        # Decide correctness
-        # Your rule: incorrect if any error code starts with "E_"
+        # ---------------------------
+        # 4) Decide correctness
+        # ---------------------------
         has_E = any(str(e.get("code", "")).startswith("E_") for e in merged_errors)
         is_correct = (not has_E)
 
-        # Text feedback
+        # ---------------------------
+        # 5) Text feedback
+        # ---------------------------
         if merged_summaries:
             feedback_items.append(("Summary", str(merged_summaries[-1])))
 
