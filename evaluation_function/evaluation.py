@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
@@ -21,7 +23,9 @@ except Exception:
         pass
 
 
+# ----------------------------
 # Pipeline import guard
+# ----------------------------
 PIPELINE_IMPORT_ERROR: Optional[Dict[str, str]] = None
 run_yolo_pipeline = None
 
@@ -37,7 +41,10 @@ except Exception as e:
     }
     run_yolo_pipeline = None
 
+
+# ----------------------------
 # URL / path helpers
+# ----------------------------
 def file_url_to_local_path(url: str) -> str:
     """
     Convert file:// URL to local path.
@@ -119,7 +126,6 @@ def _items_to_feedback_html(items: List[Tuple[Any, Any]]) -> str:
 
 
 def _escape_html(s: str) -> str:
-    # minimal safe escaping for traceback readability
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -144,11 +150,34 @@ def _error_dict_to_items(err: Dict[str, str]) -> List[Tuple[str, str]]:
 
     return items
 
+
+# ----------------------------
 # Main entry
+# ----------------------------
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
+    """
+    Expected response for Image input:
+      response = [{"url": "...", ...}, ...]
+    """
+    t0 = time.perf_counter()
+    feedback_items: List[Tuple[str, str]] = []
+
+    def mark(stage: str) -> None:
+        dt = time.perf_counter() - t0
+        msg = f"{dt:.3f}s"
+        feedback_items.append((f"TIME::{stage}", msg))
+        # Also print (only visible if platform exposes runtime logs)
+        try:
+            print(f"[TIME] {stage}: {msg}", flush=True)
+        except Exception:
+            pass
+
     try:
+        mark("ENTER")
+
         # 0) Pipeline import guard (MOST IMPORTANT)
         if run_yolo_pipeline is None:
+            mark("PIPELINE_IMPORT_FAILED")
             if isinstance(PIPELINE_IMPORT_ERROR, dict):
                 items = _error_dict_to_items(PIPELINE_IMPORT_ERROR)
             else:
@@ -157,7 +186,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     ("ErrorCode", "E_PIPELINE_IMPORT"),
                     ("Message", f"Pipeline import failed: {PIPELINE_IMPORT_ERROR}"),
                 ]
-
+            items = items + feedback_items
             feedback_html = _items_to_feedback_html(items)
             try:
                 return Result(is_correct=False, feedback=feedback_html, feedback_items=items)
@@ -166,60 +195,92 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
         # 1) Validate input
         if not isinstance(response, list) or len(response) == 0:
-            items = [("Response", "Please upload at least one image.")]
+            mark("BAD_INPUT_EMPTY_RESPONSE")
+            items = [("Response", "Please upload at least one image.")] + feedback_items
             feedback_html = _items_to_feedback_html(items)
             try:
                 return Result(is_correct=False, feedback=feedback_html, feedback_items=items)
             except TypeError:
                 return Result(is_correct=False, feedback_items=items)
 
-        # 2) Optional controls
+        # 2) Debug switches / controls
         return_images: bool = bool(_pget(params, "return_images", False))
         debug: bool = bool(_pget(params, "debug", False))
 
+        # New debug controls to diagnose "general error"
+        fast_return: bool = bool(_pget(params, "fast_return", False))
+        single_image: bool = bool(_pget(params, "single_image", True))  # default True for stability
+
+        # model filenames (relative under evaluation_function/)
         gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
         shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
+
+        feedback_items.append(("Python", sys.version.replace("\n", " ")))
+        feedback_items.append(("single_image", str(single_image)))
+        feedback_items.append(("return_images", str(return_images)))
+        feedback_items.append(("debug", str(debug)))
+        feedback_items.append(("gear_model_rel", gear_model_rel))
+        feedback_items.append(("shaft_model_rel", shaft_model_rel))
+
+        mark("PARAMS_PARSED")
+
+        # 2.5) Fast return: confirm platform can execute and return Result
+        if fast_return:
+            mark("FAST_RETURN_BEFORE_YOLO")
+            items = [("Result", "fast_return=True: reached evaluation entry successfully (no YOLO).")] + feedback_items
+            feedback_html = _items_to_feedback_html(items)
+            try:
+                return Result(is_correct=False, feedback=feedback_html, feedback_items=items)
+            except TypeError:
+                return Result(is_correct=False, feedback_items=items)
 
         # 3) Process images
         merged_errors: List[Dict[str, str]] = []
         merged_summaries: List[Dict[str, Any]] = []
         merged_ratios: List[Dict[str, Any]] = []
-        feedback_items: List[Tuple[str, str]] = []
+
+        mark("LOOP_START")
 
         for idx, item in enumerate(response):
+            if single_image and idx > 0:
+                feedback_items.append(("Info", "single_image=True: only processed image[0]"))
+                break
+
             url = item.get("url") if isinstance(item, dict) else None
             if not url:
                 merged_errors.append({"code": "E_NO_URL", "message": f"Image [{idx}] has no 'url' field."})
                 continue
 
+            if debug:
+                feedback_items.append((f"Input URL [{idx}]", str(url)))
+
+            mark(f"IMG[{idx}]::BEFORE_LOAD")
             img_bgr, err = _load_bgr_image_from_url(url)
+            mark(f"IMG[{idx}]::AFTER_LOAD")
+
             if img_bgr is None:
                 merged_errors.append({
                     "code": "E_LOAD_FAIL",
                     "message": f"Failed to load image [{idx}] from URL. ({err})"
                 })
-                if debug:
-                    feedback_items.append((f"Input URL [{idx}]", str(url)))
                 continue
 
             # ---- Run YOLO pipeline safely per-image ----
             try:
-                out = run_yolo_pipeline(
+                mark(f"IMG[{idx}]::BEFORE_PIPELINE")
+                out = run_yolo_pipeline(  # type: ignore[misc]
                     img_bgr=img_bgr,
                     gear_model_rel=gear_model_rel,
                     shaft_model_rel=shaft_model_rel,
                     return_images=return_images,
                 )
+                mark(f"IMG[{idx}]::AFTER_PIPELINE")
             except Exception as e:
+                mark(f"IMG[{idx}]::PIPELINE_EXCEPTION")
                 msg = f"Pipeline failed on image[{idx}]: {type(e).__name__}: {e}"
                 if debug:
                     msg += "\n" + traceback.format_exc()
-                merged_errors.append({
-                    "code": "E_PIPELINE_RUNTIME",
-                    "message": msg
-                })
-                if debug:
-                    feedback_items.append((f"Input URL [{idx}]", str(url)))
+                merged_errors.append({"code": "E_PIPELINE_RUNTIME", "message": msg})
                 continue
 
             # Collect outputs safely
@@ -232,7 +293,12 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             if isinstance(ratio, dict):
                 merged_ratios.append(ratio)
             if isinstance(errors, list):
-                merged_errors.extend(errors)
+                # ensure each error is dict-like
+                for e in errors:
+                    if isinstance(e, dict):
+                        merged_errors.append({"code": str(e.get("code", "E_ERR")), "message": str(e.get("message", ""))})
+                    else:
+                        merged_errors.append({"code": "E_ERR", "message": str(e)})
 
             # Optional annotated images upload (off by default)
             if return_images:
@@ -241,11 +307,13 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     for key in ("det_img", "label_img"):
                         if key in imgs and isinstance(imgs[key], np.ndarray):
                             try:
+                                mark(f"IMG[{idx}]::BEFORE_UPLOAD::{key}")
                                 png_bytes = _cv2_bgr_to_png_bytes(imgs[key])
                                 img_url = upload_image(png_bytes, "eduvision")
                                 feedback_items.append(
                                     (f"{key} [{idx}]", f"<a href=\"{img_url}\" target=\"_blank\">{key}</a>")
                                 )
+                                mark(f"IMG[{idx}]::AFTER_UPLOAD::{key}")
                             except ImageUploadError as e:
                                 merged_errors.append({
                                     "code": "E_UPLOAD_FAIL",
@@ -259,19 +327,18 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 elif upload_image is None and debug:
                     feedback_items.append(("Images", "return_images=True but upload_image() is not available in this lf_toolkit version."))
 
-            if debug:
-                feedback_items.append((f"Input URL [{idx}]", str(url)))
+        mark("LOOP_END")
 
-        # 4) Decide correctness
+        # 4) Decide correctness: any E_* means incorrect
         has_E = any(str(e.get("code", "")).startswith("E_") for e in merged_errors)
         is_correct = (not has_E)
 
         # 5) Text feedback
         if merged_summaries:
-            feedback_items.append(("Summary", str(merged_summaries[-1])))
+            feedback_items.append(("Summary(last)", str(merged_summaries[-1])))
 
         if merged_ratios:
-            feedback_items.append(("Ratio", str(merged_ratios[-1])))
+            feedback_items.append(("Ratio(last)", str(merged_ratios[-1])))
 
         if merged_errors:
             lines = [f"- {e.get('code', 'E_ERR')}: {e.get('message', '')}" for e in merged_errors]
@@ -279,6 +346,8 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
         if not feedback_items:
             feedback_items = [("Result", "No valid images could be processed.")]
+
+        mark("BEFORE_RETURN")
 
         feedback_html = _items_to_feedback_html(feedback_items)
 
@@ -291,14 +360,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         # Absolute last-resort: never crash the platform UI
         tb = traceback.format_exc()
         safe_tb = _escape_html(tb)
-        items = [
+        items: List[Tuple[str, str]] = [
             ("Stage", "UNHANDLED"),
             ("ErrorCode", "E_UNHANDLED"),
             ("ExceptionType", type(e).__name__),
             ("Message", str(e)),
             ("Traceback", f"<pre>{safe_tb}</pre>"),
             ("Traceback(html)", safe_tb.replace("\n", "<br>")),
-        ]
+        ] + feedback_items
+
         feedback_html = _items_to_feedback_html(items)
         try:
             return Result(is_correct=False, feedback=feedback_html, feedback_items=items)

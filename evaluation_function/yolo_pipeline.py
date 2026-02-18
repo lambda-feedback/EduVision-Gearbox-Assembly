@@ -7,7 +7,6 @@ YOLO inference pipeline (gear model + shaft OBB model)
 - Keeps your core logic: object building, shaft assignment, stage chain naming,
   assembly error checks, and gear-ratio computation.
 """
-
 from __future__ import annotations
 
 import math
