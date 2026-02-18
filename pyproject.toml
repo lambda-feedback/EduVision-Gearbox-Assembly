@@ -13,27 +13,16 @@ evaluation_function_dev = "evaluation_function.dev:dev"
 [tool.poetry.dependencies]
 python = "^3.12"
 typing_extensions = "^4.12.2"
-
-# Force torch/torchvision to come from CPU-only PyTorch wheel index
-torch = { version = "^2.7.0", source = "pytorch-cpu" }
-torchvision = { version = "^0.22.0", source = "pytorch-cpu" }
-
-lf_toolkit = { git = "https://github.com/lambda-feedback/toolkit-python.git", branch = "main", extras = ["ipc"] }
-
-opencv-python-headless = "^4.12.0.88"
-pillow = "^12.1.0"
+lf_toolkit = { git = "https://github.com/lambda-feedback/toolkit-python.git", branch = "feature/image-upload", extras = [
+    "ipc",
+] }
 ultralytics = "^8.1.50"
-numpy = "^2.0.0"
+pillow = "^12.1.0"
+opencv-python-headless = "^4.12.0.88"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.2"
 flake8 = "^7.1.0"
-
-# IMPORTANT: add CPU-only PyTorch source and make it explicit
-[[tool.poetry.source]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]
