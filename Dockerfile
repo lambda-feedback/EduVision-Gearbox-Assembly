@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=$POETRY_CACHE_DIR \
     poetry install --without dev --no-root
 
 # Sanity check: ensure torch is CPU-only (cuda should be None)
-RUN python -c "import torch; print('torch', torch.__version__); print('torch.cuda', torch.version.cuda); print('cuda available', torch.cuda.is_available())"
+RUN /app/.venv/bin/python -c "import torch; print('torch', torch.__version__); print('torch.cuda', torch.version.cuda); print('cuda available', torch.cuda.is_available())"
 
 
 FROM ghcr.io/lambda-feedback/evaluation-function-base/python:3.12
