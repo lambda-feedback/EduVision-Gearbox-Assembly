@@ -163,6 +163,75 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
+        if diag == "mem":
+            try:
+                import platform
+                import resource
+
+                items.append(("platform", platform.platform()))
+                items.append(("python", platform.python_version()))
+                items.append(("pid", str(os.getpid())))
+
+                # RSS (KB) on Linux from resource; on some platforms may differ
+                try:
+                    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    items.append(("ru_maxrss", str(rss_kb)))
+                except Exception as e:
+                    items.append(("ru_maxrss_FAIL", f"{type(e).__name__}: {e}"))
+
+                # cgroup memory limit (common in containers / Lambda)
+                candidates = [
+                    "/sys/fs/cgroup/memory.max",  # cgroup v2
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+                ]
+                for p in candidates:
+                    if os.path.exists(p):
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                items.append((os.path.basename(p), f.read().strip()))
+                        except Exception as e:
+                            items.append((os.path.basename(p) + "_FAIL", f"{type(e).__name__}: {e}"))
+
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception as e:
+                items.append(("MEM_FAIL", f"{type(e).__name__}: {e}"))
+                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+        # ----------------------------
+        # A0) torch minimal import probe (as light as possible)
+        # ----------------------------
+        if diag == "torch_min":
+            try:
+                # Minimal: import only (avoid extra probing)
+                _, dt = _timeit(lambda: __import__("torch"))
+                items.append(("A0_torch_min", "import OK"))
+                items.append(("t_torch_import_s", f"{dt:.4f}"))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception as e:
+                items.append(("A0_torch_min_FAIL", f"{type(e).__name__}: {e}"))
+                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+        # ----------------------------
+        # B0) ultralytics minimal import probe (import package only, don't touch YOLO)
+        # ----------------------------
+        if diag == "ultra_min":
+            try:
+                _, dt = _timeit(lambda: __import__("ultralytics"))
+                items.append(("B0_ultra_min", "import OK"))
+                items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception as e:
+                items.append(("B0_ultra_min_FAIL", f"{type(e).__name__}: {e}"))
+                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
         # ----------------------------
         # A) torch lazy import timing (CPU-only friendly)
         # ----------------------------
