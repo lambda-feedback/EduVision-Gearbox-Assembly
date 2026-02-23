@@ -163,7 +163,8 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # MEM) Environment & memory diagnostics (no torch/ultralytics)
+        # ----------------------------
+        # MEM) Short env/memory diagnostics (keep output small)
         # ----------------------------
         if diag == "mem":
             try:
@@ -171,60 +172,38 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 import resource
                 import sys
 
-                items.append(("MEM", "env/memory diagnostics"))
                 items.append(("platform", platform.platform()))
                 items.append(("python_version", platform.python_version()))
-                items.append(("python_implementation", platform.python_implementation()))
                 items.append(("pid", str(os.getpid())))
 
-                # sys.path (truncate to avoid huge output)
-                try:
-                    sp = "\n".join(sys.path[:20])
-                    items.append(("sys_path_head", _escape_html(sp).replace("\n", "<br>")))
-                except Exception as e:
-                    items.append(("sys_path_head_FAIL", f"{type(e).__name__}: {e}"))
-
-                # ru_maxrss: max resident set size so far
-                # On Linux: typically KB; on macOS: bytes. Platform is Linux here.
+                # ru_maxrss (Linux KB)
                 try:
                     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    items.append(("ru_maxrss_raw", str(rss)))
-                    # Best-effort human-friendly conversion assuming Linux KB.
-                    try:
-                        rss_mb = float(rss) / 1024.0
-                        items.append(("ru_maxrss_mb_est", f"{rss_mb:.2f}"))
-                    except Exception:
-                        pass
+                    items.append(("ru_maxrss_kb", str(rss)))
+                    items.append(("ru_maxrss_mb_est", f"{(float(rss) / 1024.0):.2f}"))
                 except Exception as e:
                     items.append(("ru_maxrss_FAIL", f"{type(e).__name__}: {e}"))
 
-                # cgroup memory limits / usage
-                # We ALWAYS emit FOUND/NOT_FOUND for each path.
+                # Only read the most important cgroup files; don't spam NOT_FOUND
                 cgroup_files = [
-                    # cgroup v2 common files
-                    "/sys/fs/cgroup/memory.max",
-                    "/sys/fs/cgroup/memory.high",
+                    "/sys/fs/cgroup/memory.max",  # cgroup v2
                     "/sys/fs/cgroup/memory.current",
-                    "/sys/fs/cgroup/memory.swap.max",
-                    "/sys/fs/cgroup/cpu.max",
-                    # cgroup v1 common files
-                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-                    "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
                     "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-                    "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
                 ]
 
                 for p in cgroup_files:
-                    key = f"cgroup:{os.path.basename(p)}"
-                    if os.path.exists(p):
-                        try:
-                            with open(p, "r", encoding="utf-8") as f:
-                                val = f.read().strip()
-                            items.append((key, val))
-                        except Exception as e:
-                            items.append((key + "_READ_FAIL", f"{type(e).__name__}: {e}"))
-                    else:
-                        items.append((key, "NOT_FOUND"))
+                    if not os.path.exists(p):
+                        continue
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            val = f.read().strip()
+                        # truncate just in case
+                        if len(val) > 64:
+                            val = val[:64] + "..."
+                        items.append((os.path.basename(p), val))
+                    except Exception as e:
+                        items.append((os.path.basename(p) + "_READ_FAIL", f"{type(e).__name__}: {e}"))
 
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
@@ -268,18 +247,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-        if diag == "alloc":
+        if diag == "alloc_once":
             try:
-                step_mb = int(_pget(params, "alloc_step_mb", 64))
-                max_mb = int(_pget(params, "alloc_max_mb", 1024))
-                chunks = []
-                allocated = 0
-                while allocated + step_mb <= max_mb:
-                    chunks.append(bytearray(step_mb * 1024 * 1024))
-                    allocated += step_mb
-                    items.append(("alloc_mb", str(allocated)))
-                    _add_common_timing(items, t_handler0)
-                items.append(("ALLOC_DONE", f"{allocated}MB"))
+                step_mb = int(_pget(params, "alloc_step_mb", 16))
+                items.append(("alloc_step_mb", str(step_mb)))
+
+                # allocate one chunk only
+                _buf = bytearray(step_mb * 1024 * 1024)
+                items.append(("alloc_status", f"allocated {step_mb}MB ✅"))
+
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
