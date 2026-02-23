@@ -163,37 +163,72 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
+        # MEM) Environment & memory diagnostics (no torch/ultralytics)
+        # ----------------------------
         if diag == "mem":
             try:
                 import platform
                 import resource
+                import sys
 
+                items.append(("MEM", "env/memory diagnostics"))
                 items.append(("platform", platform.platform()))
-                items.append(("python", platform.python_version()))
+                items.append(("python_version", platform.python_version()))
+                items.append(("python_implementation", platform.python_implementation()))
                 items.append(("pid", str(os.getpid())))
 
-                # RSS (KB) on Linux from resource; on some platforms may differ
+                # sys.path (truncate to avoid huge output)
                 try:
-                    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    items.append(("ru_maxrss", str(rss_kb)))
+                    sp = "\n".join(sys.path[:20])
+                    items.append(("sys_path_head", _escape_html(sp).replace("\n", "<br>")))
+                except Exception as e:
+                    items.append(("sys_path_head_FAIL", f"{type(e).__name__}: {e}"))
+
+                # ru_maxrss: max resident set size so far
+                # On Linux: typically KB; on macOS: bytes. Platform is Linux here.
+                try:
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    items.append(("ru_maxrss_raw", str(rss)))
+                    # Best-effort human-friendly conversion assuming Linux KB.
+                    try:
+                        rss_mb = float(rss) / 1024.0
+                        items.append(("ru_maxrss_mb_est", f"{rss_mb:.2f}"))
+                    except Exception:
+                        pass
                 except Exception as e:
                     items.append(("ru_maxrss_FAIL", f"{type(e).__name__}: {e}"))
 
-                # cgroup memory limit (common in containers / Lambda)
-                candidates = [
-                    "/sys/fs/cgroup/memory.max",  # cgroup v2
-                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+                # cgroup memory limits / usage
+                # We ALWAYS emit FOUND/NOT_FOUND for each path.
+                cgroup_files = [
+                    # cgroup v2 common files
+                    "/sys/fs/cgroup/memory.max",
+                    "/sys/fs/cgroup/memory.high",
+                    "/sys/fs/cgroup/memory.current",
+                    "/sys/fs/cgroup/memory.swap.max",
+                    "/sys/fs/cgroup/cpu.max",
+                    # cgroup v1 common files
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                    "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",
+                    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                    "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
                 ]
-                for p in candidates:
+
+                for p in cgroup_files:
+                    key = f"cgroup:{os.path.basename(p)}"
                     if os.path.exists(p):
                         try:
                             with open(p, "r", encoding="utf-8") as f:
-                                items.append((os.path.basename(p), f.read().strip()))
+                                val = f.read().strip()
+                            items.append((key, val))
                         except Exception as e:
-                            items.append((os.path.basename(p) + "_FAIL", f"{type(e).__name__}: {e}"))
+                            items.append((key + "_READ_FAIL", f"{type(e).__name__}: {e}"))
+                    else:
+                        items.append((key, "NOT_FOUND"))
 
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
+
             except Exception as e:
                 items.append(("MEM_FAIL", f"{type(e).__name__}: {e}"))
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
@@ -232,6 +267,27 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
+
+        if diag == "alloc":
+            try:
+                step_mb = int(_pget(params, "alloc_step_mb", 64))
+                max_mb = int(_pget(params, "alloc_max_mb", 1024))
+                chunks = []
+                allocated = 0
+                while allocated + step_mb <= max_mb:
+                    chunks.append(bytearray(step_mb * 1024 * 1024))
+                    allocated += step_mb
+                    items.append(("alloc_mb", str(allocated)))
+                    _add_common_timing(items, t_handler0)
+                items.append(("ALLOC_DONE", f"{allocated}MB"))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception as e:
+                items.append(("ALLOC_FAIL", f"{type(e).__name__}: {e}"))
+                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
         # ----------------------------
         # A) torch lazy import timing (CPU-only friendly)
         # ----------------------------
