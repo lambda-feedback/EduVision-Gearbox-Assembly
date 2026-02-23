@@ -6,18 +6,44 @@ YOLO inference pipeline (gear model + shaft OBB model)
 - No folder scanning / no CSV writing (Lambda-friendly)
 - Keeps your core logic: object building, shaft assignment, stage chain naming,
   assembly error checks, and gear-ratio computation.
+
+Minimal-intrusive optimisations added:
+1) Lazy-load ultralytics/torch to reduce Lambda cold-start import time.
+2) Timing instrumentation (model load + inference + total time).
+3) Cold-start flag (per-process) to help debugging on Lambda.
+4) Optional debug metadata in output.
+
+NOTE:
+- This file assumes lazy_load.py is located at: evaluation_function/lazy_load.py
+  and provides LazyModule("...").
 """
 from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+import time
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+
+# =========================
+# Lazy import hooks
+# =========================
+# Relative import (recommended inside evaluation_function package)
+from .lazy_load import LazyModule
+
+# Do NOT import ultralytics/torch at module import time (Lambda cold start)
+_ultralytics = LazyModule("ultralytics")
+
+# Cold-start flag (per-process). First invocation in this container => cold start.
+_COLD_START_FLAG = True
+
+if TYPE_CHECKING:
+    from ultralytics import YOLO as _YOLO  # pragma: no cover
+else:
+    _YOLO = Any  # runtime typing fallback
 
 
 # =========================
@@ -106,18 +132,38 @@ def _abs_model_path(rel_name: str) -> str:
 # Model cache
 # =========================
 @lru_cache(maxsize=2)
-def _load_yolo_model(abs_path: str) -> YOLO:
+def _load_yolo_model(abs_path: str) -> Any:
+    """
+    Lazy-load ultralytics and load YOLO model from abs_path.
+    Cached per-process to avoid repeated initialisation cost.
+    """
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Model not found: {abs_path}")
-    return YOLO(abs_path)
+
+    # Trigger lazy import here (not at module import time)
+    YOLO_cls = _ultralytics.YOLO
+    return YOLO_cls(abs_path)
 
 
 def get_models(
     gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
     shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
-) -> Tuple[YOLO, YOLO]:
+    timing: Optional[Dict[str, float]] = None,
+) -> Tuple[Any, Any]:
+    """
+    Load / fetch cached models. Optionally populate timing dict.
+    """
+    t0 = time.perf_counter()
     gear_model = _load_yolo_model(_abs_model_path(gear_model_rel))
+    t1 = time.perf_counter()
     shaft_model = _load_yolo_model(_abs_model_path(shaft_model_rel))
+    t2 = time.perf_counter()
+
+    if timing is not None:
+        timing["t_load_gear_model_s"] = float(t1 - t0)
+        timing["t_load_shaft_model_s"] = float(t2 - t1)
+        timing["t_get_models_total_s"] = float(t2 - t0)
+
     return gear_model, shaft_model
 
 
@@ -551,7 +597,7 @@ def evaluate_assembly_errors(
 # =========================
 # Detection
 # =========================
-def run_detection_gear(img_bgr: np.ndarray, gear_model: YOLO) -> List[Dict[str, Any]]:
+def run_detection_gear(img_bgr: np.ndarray, gear_model: Any) -> List[Dict[str, Any]]:
     res = gear_model(img_bgr, verbose=False)[0]
     names = res.names
     dets: List[Dict[str, Any]] = []
@@ -571,7 +617,7 @@ def run_detection_gear(img_bgr: np.ndarray, gear_model: YOLO) -> List[Dict[str, 
     return dets
 
 
-def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: YOLO) -> List[Dict[str, Any]]:
+def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[str, Any]]:
     res = shaft_model(img_bgr, verbose=False)[0]
     names = res.names
     dets: List[Dict[str, Any]] = []
@@ -1032,30 +1078,27 @@ def run_yolo_pipeline(
 ) -> Dict[str, Any]:
     """
     Main pipeline entry.
-
-    Args:
-        img_bgr: OpenCV BGR image (np.ndarray)
-        gear_model_rel: relative model filename under evaluation_function/
-        shaft_model_rel: relative model filename under evaluation_function/
-        return_images: if True, returns annotated images (det_img, label_img)
-
-    Returns:
-        dict with:
-            - summary
-            - detections (gear model dets + shaft OBB dets)
-            - gears/spacers/mesh/mismesh/shafts parsed objects
-            - gear_names, gear_stage, chain_pairs
-            - ratio info
-            - errors (list of {code,message})
-            - images (optional)
     """
     if img_bgr is None or not hasattr(img_bgr, "shape"):
         raise ValueError("img_bgr must be a valid OpenCV image (BGR).")
 
-    gear_model, shaft_model = get_models(gear_model_rel, shaft_model_rel)
+    global _COLD_START_FLAG
+    is_cold_start = _COLD_START_FLAG
+    _COLD_START_FLAG = False
 
+    t0_total = time.perf_counter()
+    timing: Dict[str, float] = {}
+
+    gear_model, shaft_model = get_models(gear_model_rel, shaft_model_rel, timing=timing)
+
+    t_g0 = time.perf_counter()
     gear_dets = run_detection_gear(img_bgr, gear_model)
+    timing["t_infer_gear_s"] = float(time.perf_counter() - t_g0)
+
+    t_s0 = time.perf_counter()
     shaft_obbs = run_detection_shaft_obb(img_bgr, shaft_model)
+    timing["t_infer_shaft_s"] = float(time.perf_counter() - t_s0)
+
     gears, spacers, mesh_boxes, mismesh_boxes = build_objects(gear_dets)
     contact_boxes = list(mesh_boxes) + list(mismesh_boxes)
 
@@ -1074,7 +1117,11 @@ def run_yolo_pipeline(
             "gear_stage": {},
             "chain_pairs": [],
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
         }
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
         if return_images:
             out["images"] = {"det_img": img_bgr.copy(), "label_img": img_bgr.copy()}
         return out
@@ -1145,8 +1192,15 @@ def run_yolo_pipeline(
             "per_stage": per_stage,
         },
         "errors": errors,
+        "cold_start": bool(is_cold_start),
     }
 
+    # ---- timings/debug ----
+    timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+    out["timing"] = timing
+    out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
+
+    # ---- images (unchanged core drawing logic) ----
     if return_images:
         det_img = img_bgr.copy()
         label_img = img_bgr.copy()

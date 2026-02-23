@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import json
+import time
 import traceback
-from typing import Any, List, Tuple, Optional
+from typing import Any, List, Tuple, Optional, Callable
 from urllib.parse import urlparse, unquote
 
 import cv2
@@ -11,6 +13,13 @@ import requests
 
 from lf_toolkit.evaluation import Result, Params
 
+
+# Lazy loading
+from evaluation_function.lazy_load import LazyModule
+
+torch = LazyModule("torch")
+ultralytics = LazyModule("ultralytics")
+_MODULE_IMPORT_T0 = time.perf_counter()
 
 def _pget(params: Params, key: str, default: Any) -> Any:
     try:
@@ -42,6 +51,14 @@ def _result(is_correct: bool, items: List[Tuple[str, str]]) -> Result:
         return Result(is_correct=is_correct, feedback=html, feedback_items=items)
     except TypeError:
         return Result(is_correct=is_correct, feedback_items=items)
+
+
+def _timeit(fn: Callable[[], Any]) -> Tuple[Any, float]:
+    """Measure wall time of fn() using perf_counter()."""
+    t0 = time.perf_counter()
+    out = fn()
+    dt = time.perf_counter() - t0
+    return out, dt
 
 
 def file_url_to_local_path(url: str) -> str:
@@ -78,8 +95,7 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
         return None, str(e)
 
 
-# ---------- NEW: ABCDE helpers (minimal & safe) ----------
-
+# ABCDE helpers (minimal & safe)
 def _candidate_model_paths() -> List[str]:
     """
     Matches your repo layout:
@@ -98,6 +114,13 @@ def _candidate_model_paths() -> List[str]:
     ]
 
 
+def _add_common_timing(items: List[Tuple[str, str]], t_handler0: float) -> None:
+    """Append common timing fields."""
+    now = time.perf_counter()
+    items.append(("t_module_import_to_handler_s", f"{now - _MODULE_IMPORT_T0:.4f}"))
+    items.append(("t_handler_elapsed_s", f"{now - t_handler0:.4f}"))
+
+
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
     Smoke-test base + ABCDE diagnostics.
@@ -109,6 +132,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
       diag="torch" | "ultralytics" | "model_exists" | "load_model" | "infer_once"
     """
     items: List[Tuple[str, str]] = []
+    t_handler0 = time.perf_counter()
 
     try:
         fast_return: bool = bool(_pget(params, "fast_return", True))
@@ -117,7 +141,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         debug: bool = bool(_pget(params, "debug", True))
         skip_load_check: bool = bool(_pget(params, "skip_load_check", False))
 
-        # NEW: diag switch
+        # diag switch
         diag: str = str(_pget(params, "diag", "none") or "none").strip().lower()
 
         items.append(("SMOKE", "Hello / evaluation_function reached ✅"))
@@ -128,32 +152,46 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         items.append(("skip_load_check", str(skip_load_check)))
         items.append(("debug", str(debug)))
 
-        # ---- A) torch import (no image needed, but we keep flow consistent) ----
+        # Always include a cold-start proxy timing snapshot early
+        _add_common_timing(items, t_handler0)
+
+        # ----------------------------
+        # A) torch lazy import timing
+        # ----------------------------
         if diag == "torch":
             try:
-                import torch  # noqa
-                import torch
-                items.append(("A_torch", "import OK"))
+                # Trigger actual import by touching a torch attribute
+                _, dt = _timeit(lambda: torch.__version__)
+                items.append(("A_torch", "lazy import OK"))
+                items.append(("t_torch_import_s", f"{dt:.4f}"))
                 items.append(("torch_version", str(torch.__version__)))
+                # Extra checks (may trigger internal queries)
                 items.append(("cuda_available", str(torch.cuda.is_available())))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
                 items.append(("A_torch_FAIL", f"{type(e).__name__}: {e}"))
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-        # ---- B) ultralytics import ----
+        # B) ultralytics lazy import timing
         if diag == "ultralytics":
             try:
-                from ultralytics import YOLO  # noqa: F401
-                items.append(("B_ultralytics", "import OK"))
+                # Trigger ultralytics import by accessing YOLO symbol
+                YOLO, dt = _timeit(lambda: ultralytics.YOLO)
+                items.append(("B_ultralytics", "lazy import OK"))
+                items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
+                items.append(("YOLO_symbol", str(YOLO)))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
                 items.append(("B_ultralytics_FAIL", f"{type(e).__name__}: {e}"))
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-        # ---- C) model existence ----
+        # C) model existence
         if diag == "model_exists":
             paths = _candidate_model_paths()
             any_found = False
@@ -168,13 +206,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             if not any_found:
                 items.append(("C_FAIL", "No model files found in candidate paths"))
                 items.append(("C_candidates", " | ".join(paths)))
+            _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # ---- D/E require an image -> we continue below to load image first ----
+        # D/E require an image -> continue to load image first
 
         # 1) Validate input (unit test requirement)
         if not isinstance(response, list) or len(response) == 0:
             items.append(("BAD_INPUT", "No images uploaded."))
+            _add_common_timing(items, t_handler0)
             return _result(False, items)
 
         # 2) Extract first URL
@@ -191,15 +231,18 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
         if not url:
             items.append(("LOAD_FAIL", "LOAD_FAIL: first image has no url field"))
+            _add_common_timing(items, t_handler0)
             return _result(False, items)
 
         # 3) Load-check (keep your existing CI-safe behaviour)
         #    D/E need an image anyway, so we must load here unless explicitly skipped.
         if (not skip_load_check) or try_fetch or diag in ("load_model", "infer_once"):
-            img, err = _load_bgr_image_from_url(str(url))
+            (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
+            items.append(("t_image_load_s", f"{dt_img:.4f}"))
             if img is None:
                 items.append(("LOAD_FAIL", f"LOAD_FAIL: Failed to load image. ({err})"))
                 items.append(("url", str(url)))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
             h, w = img.shape[:2]
@@ -208,59 +251,86 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         else:
             img = None  # type: ignore
 
-        # ---- D) load model only (no inference) ----
+        # D) load model only (no inference)
         if diag == "load_model":
             try:
-                from ultralytics import YOLO
+                # Trigger ultralytics import lazily
+                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
+
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
                     items.append(("D_FAIL", "No model file found to load"))
                     items.append(("D_candidates", " | ".join(_candidate_model_paths())))
+                    _add_common_timing(items, t_handler0)
                     return _result(False, items)
+
                 items.append(("D_model_path", model_path))
-                _ = YOLO(model_path)
+
+                # Time model init/load
+                _, dt_load = _timeit(lambda: YOLO(model_path))
+                items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 items.append(("D_load", "model loaded ✅"))
+
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
                 items.append(("D_FAIL", f"{type(e).__name__}: {e}"))
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-        # ---- E) infer once (minimal) ----
+        # E) infer once (minimal)
         if diag == "infer_once":
             try:
-                from ultralytics import YOLO
+                # Trigger ultralytics import lazily
+                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
+
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
                     items.append(("E_FAIL", "No model file found for inference"))
                     items.append(("E_candidates", " | ".join(_candidate_model_paths())))
+                    _add_common_timing(items, t_handler0)
                     return _result(False, items)
 
                 if img is None:
                     items.append(("E_FAIL", "Image not loaded (img is None)"))
+                    _add_common_timing(items, t_handler0)
                     return _result(False, items)
 
                 items.append(("E_model_path", model_path))
-                model = YOLO(model_path)
-                _ = model.predict(source=img, imgsz=640, conf=0.25, verbose=False)
+
+                # Time YOLO() construction separately from predict()
+                model, dt_load = _timeit(lambda: YOLO(model_path))
+                items.append(("t_model_load_s", f"{dt_load:.4f}"))
+
+                _, dt_pred = _timeit(lambda: model.predict(source=img, imgsz=640, conf=0.25, verbose=False))
+                items.append(("t_predict_s", f"{dt_pred:.4f}"))
+
                 items.append(("E_infer", "predict done ✅"))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
                 items.append(("E_FAIL", f"{type(e).__name__}: {e}"))
                 items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # 4) Optional early exit (keep your original platform smoke behaviour)
         if fast_return and not try_fetch:
             items.append(("note", "fast_return=True (no YOLO). Load-check already done."))
+            _add_common_timing(items, t_handler0)
             return _result(False, items)
 
         # 5) Default end (still no YOLO in this build unless you add it)
         items.append(("note", "No YOLO executed in default path. Use diag=... to pinpoint failures."))
+        _add_common_timing(items, t_handler0)
         return _result(False, items)
 
     except Exception as e:
         tb = _escape_html(traceback.format_exc())
         items.append(("UNHANDLED", f"{type(e).__name__}: {e}"))
         items.append(("TRACEBACK", tb.replace("\n", "<br>")))
+        _add_common_timing(items, t_handler0)
         return _result(False, items)

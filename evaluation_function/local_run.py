@@ -8,7 +8,7 @@ from evaluation_function.yolo_pipeline import run_yolo_pipeline
 
 
 # ----local test image ----
-IMAGE_PATH = r"C:\Users\sheng\Desktop\Test2.jpg"
+IMAGE_PATH = r"C:\Users\sheng\Desktop\Test.jpg"
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "_local_out")
 os.makedirs(OUT_DIR, exist_ok=True)
