@@ -13,13 +13,13 @@ import requests
 
 from lf_toolkit.evaluation import Result, Params
 
-
 # Lazy loading
 from evaluation_function.lazy_load import LazyModule
 
 torch = LazyModule("torch")
 ultralytics = LazyModule("ultralytics")
 _MODULE_IMPORT_T0 = time.perf_counter()
+
 
 def _pget(params: Params, key: str, default: Any) -> Any:
     try:
@@ -129,7 +129,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
       - bad url -> feedback contains LOAD_FAIL
       - local file:// url works
     Diagnostics via params["diag"] (or Params.diag):
-      diag="torch" | "ultralytics" | "model_exists" | "load_model" | "infer_once"
+      diag="ping" | "torch" | "ultralytics" | "model_exists" | "load_model" | "infer_once"
     """
     items: List[Tuple[str, str]] = []
     t_handler0 = time.perf_counter()
@@ -156,7 +156,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         _add_common_timing(items, t_handler0)
 
         # ----------------------------
-        # A) torch lazy import timing
+        # P) ping: absolute minimum path (no image, no torch/ultralytics)
+        # ----------------------------
+        if diag == "ping":
+            items.append(("PING", "OK ✅"))
+            _add_common_timing(items, t_handler0)
+            return _result(False, items)
+
+        # ----------------------------
+        # A) torch lazy import timing (CPU-only friendly)
         # ----------------------------
         if diag == "torch":
             try:
@@ -165,8 +173,10 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("A_torch", "lazy import OK"))
                 items.append(("t_torch_import_s", f"{dt:.4f}"))
                 items.append(("torch_version", str(torch.__version__)))
-                # Extra checks (may trigger internal queries)
-                items.append(("cuda_available", str(torch.cuda.is_available())))
+
+                # NOTE: removed torch.cuda.is_available() on purpose (CPU-only wheel)
+                items.append(("cuda_check", "skipped (CPU-only build)"))
+
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception as e:
@@ -175,7 +185,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
+        # ----------------------------
         # B) ultralytics lazy import timing
+        # ----------------------------
         if diag == "ultralytics":
             try:
                 # Trigger ultralytics import by accessing YOLO symbol
@@ -191,7 +203,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
+        # ----------------------------
         # C) model existence
+        # ----------------------------
         if diag == "model_exists":
             paths = _candidate_model_paths()
             any_found = False
@@ -235,7 +249,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             return _result(False, items)
 
         # 3) Load-check (keep your existing CI-safe behaviour)
-        #    D/E need an image anyway, so we must load here unless explicitly skipped.
         if (not skip_load_check) or try_fetch or diag in ("load_model", "infer_once"):
             (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
             items.append(("t_image_load_s", f"{dt_img:.4f}"))
@@ -254,7 +267,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         # D) load model only (no inference)
         if diag == "load_model":
             try:
-                # Trigger ultralytics import lazily
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
                 items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
 
@@ -267,7 +279,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
                 items.append(("D_model_path", model_path))
 
-                # Time model init/load
                 _, dt_load = _timeit(lambda: YOLO(model_path))
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 items.append(("D_load", "model loaded ✅"))
@@ -283,7 +294,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         # E) infer once (minimal)
         if diag == "infer_once":
             try:
-                # Trigger ultralytics import lazily
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
                 items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
 
@@ -301,7 +311,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
                 items.append(("E_model_path", model_path))
 
-                # Time YOLO() construction separately from predict()
                 model, dt_load = _timeit(lambda: YOLO(model_path))
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
 
@@ -323,7 +332,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # 5) Default end (still no YOLO in this build unless you add it)
+        # 5) Default end
         items.append(("note", "No YOLO executed in default path. Use diag=... to pinpoint failures."))
         _add_common_timing(items, t_handler0)
         return _result(False, items)
