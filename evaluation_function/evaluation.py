@@ -350,7 +350,54 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
+        # ----------------------------
+        # D0) load model ONLY (no image required)
+        # ----------------------------
+        if diag == "load_model_only":
+            try:
+                _stage(items, "load_model_only_begin")
 
+                # ultralytics symbol
+                _stage(items, "ultralytics_symbol_begin")
+                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
+                _stage(items, "ultralytics_symbol_done")
+
+                model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
+                if not model_path:
+                    items.append(("D_FAIL", "No model file found to load"))
+                    items.append(("D_candidates", " | ".join(_candidate_model_paths())))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items)
+
+                items.append(("D_model_path", model_path))
+
+                # torch threads (helps slow/hang-like behaviour)
+                try:
+                    _ = torch.__version__
+                    torch.set_num_threads(1)
+                    torch.set_num_interop_threads(1)
+                    items.append(("torch_threads", "set to 1"))
+                except Exception:
+                    pass
+
+                # actual load
+                _stage(items, "yolo_load_begin")
+                _, dt_load = _timeit(lambda: YOLO(model_path))
+                items.append(("t_model_load_s", f"{dt_load:.4f}"))
+                _stage(items, "yolo_load_done")
+
+                items.append(("D_load", "model loaded ✅"))
+                _stage(items, "load_model_only_done")
+
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+            except Exception:
+                items.append(("D_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
         # ----------------------------
         # D) load model only (no inference)
         # ----------------------------
