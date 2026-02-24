@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import traceback
+import faulthandler
 from typing import Any, List, Tuple, Optional, Callable
 from urllib.parse import urlparse, unquote
 
@@ -82,6 +84,30 @@ def _stage(items: List[Tuple[str, str]], name: str) -> None:
     items.append(("stage", name))
 
 
+# ----------------------------
+# Watchdog for hangs (CloudWatch-friendly)
+# ----------------------------
+def _watchdog_start(seconds: int = 6) -> None:
+    """
+    Dump traceback of ALL threads to stderr after `seconds`.
+    In AWS Lambda, stderr goes to CloudWatch, so even if the function times out,
+    you'll still see where it was stuck.
+    """
+    try:
+        faulthandler.enable(all_threads=True, file=sys.stderr)
+        # repeat=True: keep dumping every `seconds` until cancelled
+        faulthandler.dump_traceback_later(seconds, repeat=True, file=sys.stderr, exit=False)
+    except Exception:
+        pass
+
+
+def _watchdog_stop() -> None:
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
 def file_url_to_local_path(url: str) -> str:
     parsed = urlparse(url)
     path = unquote(parsed.path)
@@ -148,7 +174,8 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
       - adds stage markers and truncates output to avoid UI freeze
     diag:
       "ping" | "mem" | "torch_min" | "ultra_min" | "torch" | "ultralytics"
-      "model_exists" | "load_model" | "infer_once"
+      "model_exists" | "stat_model" | "read_head" | "torch_load_only"
+      "load_model_only" | "load_model" | "infer_once"
     """
     items: List[Tuple[str, str]] = []
     t_handler0 = time.perf_counter()
@@ -300,6 +327,111 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             return _result(False, items)
 
         # ----------------------------
+        # model stat (size/mtime)
+        # ----------------------------
+        if diag == "stat_model":
+            _stage(items, "stat_model_begin")
+            paths = _candidate_model_paths()
+            found = [p for p in paths if os.path.exists(p)]
+            if not found:
+                items.append(("S_FAIL", "No model file found"))
+                items.append(("S_candidates", " | ".join(paths)))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+            p = found[0]
+            st = os.stat(p)
+            items.append(("model_path", p))
+            items.append(("size_bytes", str(st.st_size)))
+            items.append(("mtime", str(st.st_mtime)))
+            _stage(items, "stat_model_done")
+            _add_common_timing(items, t_handler0)
+            return _result(False, items)
+
+        # ----------------------------
+        # read first N bytes (pure file I/O speed)
+        # ----------------------------
+        if diag == "read_head":
+            _stage(items, "read_head_begin")
+            paths = _candidate_model_paths()
+            found = [p for p in paths if os.path.exists(p)]
+            if not found:
+                items.append(("R_FAIL", "No model file found"))
+                items.append(("R_candidates", " | ".join(paths)))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+            p = found[0]
+            items.append(("model_path", p))
+
+            def _read():
+                with open(p, "rb") as f:
+                    return f.read(1024 * 1024)  # 1MB
+
+            data, dt = _timeit(_read)
+            items.append(("t_read_1mb_s", f"{dt:.4f}"))
+            items.append(("read_len", str(len(data))))
+            _stage(items, "read_head_done")
+            _add_common_timing(items, t_handler0)
+            return _result(False, items)
+
+        # ----------------------------
+        # torch.load only (bypass ultralytics)
+        # ----------------------------
+        if diag == "torch_load_only":
+            try:
+                _stage(items, "torch_load_only_begin")
+
+                paths = _candidate_model_paths()
+                found = [p for p in paths if os.path.exists(p)]
+                if not found:
+                    items.append(("T_FAIL", "No model file found"))
+                    items.append(("T_candidates", " | ".join(paths)))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items)
+
+                p = found[0]
+                items.append(("model_path", p))
+
+                # ensure torch imported
+                _stage(items, "torch_version_begin")
+                _ = torch.__version__
+                items.append(("torch_version", str(torch.__version__)))
+                _stage(items, "torch_version_done")
+
+                # reduce threads
+                try:
+                    torch.set_num_threads(1)
+                    torch.set_num_interop_threads(1)
+                    items.append(("torch_threads", "set to 1"))
+                except Exception:
+                    pass
+
+                # watchdog: if this hangs, you'll see stack in CloudWatch
+                _watchdog_start(6)
+
+                _stage(items, "torch_load_begin")
+
+                def _load():
+                    return torch.load(p, map_location="cpu")
+
+                obj, dt = _timeit(_load)
+                items.append(("t_torch_load_s", f"{dt:.4f}"))
+                items.append(("torch_load_type", type(obj).__name__))
+
+                _stage(items, "torch_load_done")
+                _watchdog_stop()
+
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception:
+                _watchdog_stop()
+                items.append(("T_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+
+        # ----------------------------
         # From here: need response/url to do load-check or infer.
         # Keep original CI behaviour: bad URL => LOAD_FAIL.
         # ----------------------------
@@ -350,6 +482,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
+
         # ----------------------------
         # D0) load model ONLY (no image required)
         # ----------------------------
@@ -381,9 +514,11 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 except Exception:
                     pass
 
-                # actual load
+                # actual load (watchdog enabled)
                 _stage(items, "yolo_load_begin")
+                _watchdog_start(6)
                 _, dt_load = _timeit(lambda: YOLO(model_path))
+                _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
 
@@ -394,10 +529,12 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 return _result(False, items)
 
             except Exception:
+                _watchdog_stop()
                 items.append(("D_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
+
         # ----------------------------
         # D) load model only (no inference)
         # ----------------------------
@@ -427,7 +564,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     pass
 
                 _stage(items, "yolo_load_begin")
+                _watchdog_start(6)
                 _, dt_load = _timeit(lambda: YOLO(model_path))
+                _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
                 items.append(("D_load", "model loaded ✅"))
@@ -435,6 +574,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception:
+                _watchdog_stop()
                 items.append(("D_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
@@ -473,7 +613,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     pass
 
                 _stage(items, "yolo_load_begin")
+                _watchdog_start(6)
                 model, dt_load = _timeit(lambda: YOLO(model_path))
+                _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
 
@@ -486,6 +628,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
             except Exception:
+                _watchdog_stop()
                 items.append(("E_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
@@ -505,6 +648,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         return _result(False, items)
 
     except Exception as e:
+        _watchdog_stop()
         items.append(("UNHANDLED", f"{type(e).__name__}: {e}"))
         items.append(("TRACEBACK", _tb_short()))
         _add_common_timing(items, t_handler0)
