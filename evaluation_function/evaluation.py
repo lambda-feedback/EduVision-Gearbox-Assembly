@@ -1,7 +1,7 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
-import json
 import time
 import traceback
 from typing import Any, List, Tuple, Optional, Callable
@@ -20,6 +20,10 @@ torch = LazyModule("torch")
 ultralytics = LazyModule("ultralytics")
 _MODULE_IMPORT_T0 = time.perf_counter()
 
+# ---- Small safety caps to avoid UI freeze ----
+_MAX_ITEMS = int(os.environ.get("LF_MAX_ITEMS", "40"))
+_MAX_TB_CHARS = int(os.environ.get("LF_MAX_TB_CHARS", "1200"))
+
 
 def _pget(params: Params, key: str, default: Any) -> Any:
     try:
@@ -31,26 +35,38 @@ def _pget(params: Params, key: str, default: Any) -> Any:
             return default
 
 
+def _escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _tb_short() -> str:
+    tb = traceback.format_exc()
+    if len(tb) > _MAX_TB_CHARS:
+        tb = tb[:_MAX_TB_CHARS] + "\n... (truncated)"
+    return _escape_html(tb).replace("\n", "<br>")
+
+
 def _items_to_html(items: List[Tuple[Any, Any]]) -> str:
+    # cap output to avoid frontend freeze
+    show = items[:_MAX_ITEMS]
     lines: List[str] = []
-    for k, v in items:
+    for k, v in show:
         k = "" if k is None else str(k).strip()
         v = "" if v is None else str(v).strip()
         lines.append(f"{k}: {v}" if k else v)
+    if len(items) > _MAX_ITEMS:
+        lines.append(f"... (items truncated: showing {_MAX_ITEMS}/{len(items)})")
     return "<br>".join(lines)
-
-
-def _escape_html(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _result(is_correct: bool, items: List[Tuple[str, str]]) -> Result:
     """Return Result in a version-tolerant way (keep your working pattern)."""
     html = _items_to_html(items)
+    safe_items = items[:_MAX_ITEMS]
     try:
-        return Result(is_correct=is_correct, feedback=html, feedback_items=items)
+        return Result(is_correct=is_correct, feedback=html, feedback_items=safe_items)
     except TypeError:
-        return Result(is_correct=is_correct, feedback_items=items)
+        return Result(is_correct=is_correct, feedback_items=safe_items)
 
 
 def _timeit(fn: Callable[[], Any]) -> Tuple[Any, float]:
@@ -59,6 +75,11 @@ def _timeit(fn: Callable[[], Any]) -> Tuple[Any, float]:
     out = fn()
     dt = time.perf_counter() - t0
     return out, dt
+
+
+def _stage(items: List[Tuple[str, str]], name: str) -> None:
+    # short stage marker for locating hang points
+    items.append(("stage", name))
 
 
 def file_url_to_local_path(url: str) -> str:
@@ -82,7 +103,8 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
             return img, None
 
         if url.startswith("http://") or url.startswith("https://"):
-            resp = requests.get(url, timeout=timeout)
+            # explicit (connect, read) timeouts reduce "endless wait"
+            resp = requests.get(url, timeout=(5, timeout))
             resp.raise_for_status()
             data = np.frombuffer(resp.content, dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -95,7 +117,6 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
         return None, str(e)
 
 
-# ABCDE helpers (minimal & safe)
 def _candidate_model_paths() -> List[str]:
     """
     Matches your repo layout:
@@ -115,7 +136,6 @@ def _candidate_model_paths() -> List[str]:
 
 
 def _add_common_timing(items: List[Tuple[str, str]], t_handler0: float) -> None:
-    """Append common timing fields."""
     now = time.perf_counter()
     items.append(("t_module_import_to_handler_s", f"{now - _MODULE_IMPORT_T0:.4f}"))
     items.append(("t_handler_elapsed_s", f"{now - t_handler0:.4f}"))
@@ -123,13 +143,12 @@ def _add_common_timing(items: List[Tuple[str, str]], t_handler0: float) -> None:
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
-    Smoke-test base + ABCDE diagnostics.
-    Keeps unit-test behaviour:
-      - empty response -> is_correct=False
-      - bad url -> feedback contains LOAD_FAIL
-      - local file:// url works
-    Diagnostics via params["diag"] (or Params.diag):
-      diag="ping" | "torch" | "ultralytics" | "model_exists" | "load_model" | "infer_once"
+    Minimal diagnostics, minimal changes:
+      - keeps original tests behaviour: bad url => LOAD_FAIL
+      - adds stage markers and truncates output to avoid UI freeze
+    diag:
+      "ping" | "mem" | "torch_min" | "ultra_min" | "torch" | "ultralytics"
+      "model_exists" | "load_model" | "infer_once"
     """
     items: List[Tuple[str, str]] = []
     t_handler0 = time.perf_counter()
@@ -141,7 +160,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         debug: bool = bool(_pget(params, "debug", True))
         skip_load_check: bool = bool(_pget(params, "skip_load_check", False))
 
-        # diag switch
         diag: str = str(_pget(params, "diag", "none") or "none").strip().lower()
 
         items.append(("SMOKE", "Hello / evaluation_function reached ✅"))
@@ -152,162 +170,118 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         items.append(("skip_load_check", str(skip_load_check)))
         items.append(("debug", str(debug)))
 
-        # Always include a cold-start proxy timing snapshot early
         _add_common_timing(items, t_handler0)
+        _stage(items, "entered")
 
         # ----------------------------
-        # P) ping: absolute minimum path (no image, no torch/ultralytics)
+        # ping
         # ----------------------------
         if diag == "ping":
-            items.append(("PING", "OK ✅"))
+            _stage(items, "ping_ok")
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
         # ----------------------------
-        # MEM) Short env/memory diagnostics (keep output small)
+        # mem
         # ----------------------------
         if diag == "mem":
             try:
                 import platform
                 import resource
-                import sys
 
                 items.append(("platform", platform.platform()))
                 items.append(("python_version", platform.python_version()))
                 items.append(("pid", str(os.getpid())))
 
-                # ru_maxrss (Linux KB)
-                try:
-                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    items.append(("ru_maxrss_kb", str(rss)))
-                    items.append(("ru_maxrss_mb_est", f"{(float(rss) / 1024.0):.2f}"))
-                except Exception as e:
-                    items.append(("ru_maxrss_FAIL", f"{type(e).__name__}: {e}"))
+                rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                items.append(("ru_maxrss_kb", str(rss)))
+                items.append(("ru_maxrss_mb_est", f"{(float(rss) / 1024.0):.2f}"))
 
-                # Only read the most important cgroup files; don't spam NOT_FOUND
-                cgroup_files = [
-                    "/sys/fs/cgroup/memory.max",  # cgroup v2
-                    "/sys/fs/cgroup/memory.current",
-                    "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-                    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-                ]
-
-                for p in cgroup_files:
-                    if not os.path.exists(p):
-                        continue
-                    try:
-                        with open(p, "r", encoding="utf-8") as f:
-                            val = f.read().strip()
-                        # truncate just in case
-                        if len(val) > 64:
-                            val = val[:64] + "..."
-                        items.append((os.path.basename(p), val))
-                    except Exception as e:
-                        items.append((os.path.basename(p) + "_READ_FAIL", f"{type(e).__name__}: {e}"))
-
+                _stage(items, "mem_ok")
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-
-            except Exception as e:
-                items.append(("MEM_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("MEM_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # ----------------------------
-        # A0) torch minimal import probe (as light as possible)
+        # torch minimal import
         # ----------------------------
         if diag == "torch_min":
             try:
-                # Minimal: import only (avoid extra probing)
+                _stage(items, "torch_min_begin")
                 _, dt = _timeit(lambda: __import__("torch"))
-                items.append(("A0_torch_min", "import OK"))
                 items.append(("t_torch_import_s", f"{dt:.4f}"))
+                _stage(items, "torch_min_done")
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("A0_torch_min_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("A0_torch_min_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # ----------------------------
-        # B0) ultralytics minimal import probe (import package only, don't touch YOLO)
+        # ultralytics minimal import
         # ----------------------------
         if diag == "ultra_min":
             try:
+                _stage(items, "ultra_min_begin")
                 _, dt = _timeit(lambda: __import__("ultralytics"))
-                items.append(("B0_ultra_min", "import OK"))
                 items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
+                _stage(items, "ultra_min_done")
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("B0_ultra_min_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items)
-
-        if diag == "alloc_once":
-            try:
-                step_mb = int(_pget(params, "alloc_step_mb", 16))
-                items.append(("alloc_step_mb", str(step_mb)))
-
-                # allocate one chunk only
-                _buf = bytearray(step_mb * 1024 * 1024)
-                items.append(("alloc_status", f"allocated {step_mb}MB ✅"))
-
-                _add_common_timing(items, t_handler0)
-                return _result(False, items)
-            except Exception as e:
-                items.append(("ALLOC_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("B0_ultra_min_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # ----------------------------
-        # A) torch lazy import timing (CPU-only friendly)
+        # torch lazy import
         # ----------------------------
         if diag == "torch":
             try:
-                # Trigger actual import by touching a torch attribute
+                _stage(items, "torch_lazy_begin")
                 _, dt = _timeit(lambda: torch.__version__)
-                items.append(("A_torch", "lazy import OK"))
                 items.append(("t_torch_import_s", f"{dt:.4f}"))
                 items.append(("torch_version", str(torch.__version__)))
-
-                # NOTE: removed torch.cuda.is_available() on purpose (CPU-only wheel)
                 items.append(("cuda_check", "skipped (CPU-only build)"))
-
+                _stage(items, "torch_lazy_done")
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("A_torch_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("A_torch_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # ----------------------------
-        # B) ultralytics lazy import timing
+        # ultralytics lazy import
         # ----------------------------
         if diag == "ultralytics":
             try:
-                # Trigger ultralytics import by accessing YOLO symbol
+                _stage(items, "ultra_lazy_begin")
                 YOLO, dt = _timeit(lambda: ultralytics.YOLO)
-                items.append(("B_ultralytics", "lazy import OK"))
-                items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
+                items.append(("t_ultralytics_symbol_s", f"{dt:.4f}"))
                 items.append(("YOLO_symbol", str(YOLO)))
+                _stage(items, "ultra_lazy_done")
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("B_ultralytics_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("B_ultralytics_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
         # ----------------------------
-        # C) model existence
+        # model existence
         # ----------------------------
         if diag == "model_exists":
+            _stage(items, "model_exists_begin")
             paths = _candidate_model_paths()
             any_found = False
             for p in paths:
@@ -317,22 +291,23 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                         sz = os.path.getsize(p)
                     except Exception:
                         sz = -1
-                    items.append(("C_FOUND", f"{p} (size={sz})"))
+                    items.append(("FOUND", f"{p} (size={sz})"))
             if not any_found:
                 items.append(("C_FAIL", "No model files found in candidate paths"))
                 items.append(("C_candidates", " | ".join(paths)))
+            _stage(items, "model_exists_done")
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # D/E require an image -> continue to load image first
-
-        # 1) Validate input (unit test requirement)
+        # ----------------------------
+        # From here: need response/url to do load-check or infer.
+        # Keep original CI behaviour: bad URL => LOAD_FAIL.
+        # ----------------------------
         if not isinstance(response, list) or len(response) == 0:
             items.append(("BAD_INPUT", "No images uploaded."))
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # 2) Extract first URL
         first = response[0] if isinstance(response, list) and len(response) > 0 else None
         url = first.get("url") if isinstance(first, dict) else None
 
@@ -349,27 +324,42 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # 3) Load-check (keep your existing CI-safe behaviour)
+        # ----------------------------
+        # Load-check (minimal change): if skip_load_check=False, always validate url.
+        # This preserves your original unit tests.
+        # If you want to skip in the UI, set skip_load_check=True.
+        # ----------------------------
+        img: Optional[np.ndarray] = None
         if (not skip_load_check) or try_fetch or diag in ("load_model", "infer_once"):
-            (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
-            items.append(("t_image_load_s", f"{dt_img:.4f}"))
-            if img is None:
-                items.append(("LOAD_FAIL", f"LOAD_FAIL: Failed to load image. ({err})"))
-                items.append(("url", str(url)))
+            try:
+                _stage(items, "image_load_begin")
+                (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
+                items.append(("t_image_load_s", f"{dt_img:.4f}"))
+                if img is None:
+                    items.append(("LOAD_FAIL", f"LOAD_FAIL: Failed to load image. ({err})"))
+                    items.append(("url", str(url)))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items)
+
+                h, w = img.shape[:2]
+                items.append(("image_loaded", "OK"))
+                items.append(("shape", f"{w}x{h}"))
+                _stage(items, "image_load_done")
+            except Exception:
+                items.append(("LOAD_FAIL", "LOAD_FAIL: Exception during image load"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-            h, w = img.shape[:2]
-            items.append(("image_loaded", "OK"))
-            items.append(("shape", f"{w}x{h}"))
-        else:
-            img = None  # type: ignore
-
+        # ----------------------------
         # D) load model only (no inference)
+        # ----------------------------
         if diag == "load_model":
             try:
+                _stage(items, "ultralytics_symbol_begin")
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
-                items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
+                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
+                _stage(items, "ultralytics_symbol_done")
 
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
@@ -380,23 +370,38 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
                 items.append(("D_model_path", model_path))
 
+                # Optional: limit threads (small + safe)
+                try:
+                    _ = torch.__version__
+                    torch.set_num_threads(1)
+                    torch.set_num_interop_threads(1)
+                    items.append(("torch_threads", "set to 1"))
+                except Exception:
+                    pass
+
+                _stage(items, "yolo_load_begin")
                 _, dt_load = _timeit(lambda: YOLO(model_path))
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
+                _stage(items, "yolo_load_done")
                 items.append(("D_load", "model loaded ✅"))
 
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("D_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("D_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
+        # ----------------------------
         # E) infer once (minimal)
+        # ----------------------------
         if diag == "infer_once":
             try:
+                _stage(items, "ultralytics_symbol_begin")
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
-                items.append(("t_ultralytics_import_s", f"{dt_ul:.4f}"))
+                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
+                _stage(items, "ultralytics_symbol_done")
 
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
@@ -412,35 +417,48 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
                 items.append(("E_model_path", model_path))
 
+                try:
+                    _ = torch.__version__
+                    torch.set_num_threads(1)
+                    torch.set_num_interop_threads(1)
+                    items.append(("torch_threads", "set to 1"))
+                except Exception:
+                    pass
+
+                _stage(items, "yolo_load_begin")
                 model, dt_load = _timeit(lambda: YOLO(model_path))
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
+                _stage(items, "yolo_load_done")
 
-                _, dt_pred = _timeit(lambda: model.predict(source=img, imgsz=640, conf=0.25, verbose=False))
+                _stage(items, "predict_begin")
+                _, dt_pred = _timeit(lambda: model.predict(source=img, imgsz=640, conf=0.25, device="cpu", verbose=False))
                 items.append(("t_predict_s", f"{dt_pred:.4f}"))
+                _stage(items, "predict_done")
 
                 items.append(("E_infer", "predict done ✅"))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-            except Exception as e:
-                items.append(("E_FAIL", f"{type(e).__name__}: {e}"))
-                items.append(("TRACEBACK", _escape_html(traceback.format_exc()).replace("\n", "<br>")))
+            except Exception:
+                items.append(("E_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
 
-        # 4) Optional early exit (keep your original platform smoke behaviour)
+        # ----------------------------
+        # Optional early exit (preserve your behaviour)
+        # NOTE: By the time we get here, load-check has already run (unless skip_load_check=True).
+        # ----------------------------
         if fast_return and not try_fetch:
-            items.append(("note", "fast_return=True (no YOLO). Load-check already done."))
+            items.append(("note", "fast_return=True (no YOLO). Load-check already done unless skip_load_check=True."))
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
-        # 5) Default end
         items.append(("note", "No YOLO executed in default path. Use diag=... to pinpoint failures."))
         _add_common_timing(items, t_handler0)
         return _result(False, items)
 
     except Exception as e:
-        tb = _escape_html(traceback.format_exc())
         items.append(("UNHANDLED", f"{type(e).__name__}: {e}"))
-        items.append(("TRACEBACK", tb.replace("\n", "<br>")))
+        items.append(("TRACEBACK", _tb_short()))
         _add_common_timing(items, t_handler0)
         return _result(False, items)
