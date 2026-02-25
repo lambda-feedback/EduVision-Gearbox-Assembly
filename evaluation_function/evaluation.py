@@ -402,6 +402,30 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _add_common_timing(items, t_handler0)
             return _result(False, items)
 
+
+        if diag == "subprocess_smoke":
+            try:
+                import subprocess
+                _stage(items, "subprocess_smoke_begin")
+                t0 = time.perf_counter()
+                cp = subprocess.run(
+                    [sys.executable, "-c", "print('OK')"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                items.append(("rc", str(cp.returncode)))
+                items.append(("stdout", (cp.stdout or "").strip()))
+                items.append(("stderr", (cp.stderr or "").strip()))
+                items.append(("t_smoke_s", f"{time.perf_counter() - t0:.4f}"))
+                _stage(items, "subprocess_smoke_done")
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
+            except Exception:
+                items.append(("SUBPROC_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
         # ----------------------------
         # torch.load only (bypass ultralytics) WITH HARD TIMEOUT
         # Uses subprocess instead of multiprocessing to avoid SemLock (/dev/shm) issues.
