@@ -427,8 +427,11 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
         # ----------------------------
-        # torch.load only (bypass ultralytics) WITH HARD TIMEOUT
-        # Uses subprocess instead of multiprocessing to avoid SemLock (/dev/shm) issues.
+        # ----------------------------
+        # torch.load only (bypass ultralytics) WITH HARD TIMEOUT (robust)
+        # - Avoid capture_output pipes (can hang with heavy libs)
+        # - Child writes JSON to /tmp, parent reads it
+        # - Parent enforces timeout and kills child
         # ----------------------------
         if diag == "torch_load_only":
             try:
@@ -445,20 +448,22 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 p = found[0]
                 items.append(("model_path", p))
 
-                # Keep comfortably below 10s cold-start limit
                 load_timeout_s = float(os.environ.get("LF_TORCHLOAD_TIMEOUT_S", "6.5"))
                 items.append(("torchload_timeout_s", str(load_timeout_s)))
 
                 import subprocess
                 import json
+                import uuid
 
-                # Tiny snippet executed in a separate process:
-                # - imports torch inside the child
-                # - runs torch.load with weights_only when supported
-                # - prints ONE JSON line to stdout
+                out_path = f"/tmp/torchload_{uuid.uuid4().hex}.json"
+                items.append(("torchload_out_path", out_path))
+
+                # Child: write exactly one JSON object to out_path
                 code = r"""
-        import time, json, sys
+        import time, json, sys, os
         t0 = time.perf_counter()
+        path = sys.argv[1]
+        out_path = sys.argv[2]
         try:
             import torch
             try:
@@ -467,32 +472,51 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             except Exception:
                 pass
 
-            path = sys.argv[1]
+            # 先测 import 时间（对定位很有用）
+            t_import_done = time.perf_counter()
 
-            # Prefer safer/lighter load if supported (PyTorch >= 2.0-ish)
             try:
                 obj = torch.load(path, map_location="cpu", weights_only=True)
             except TypeError:
                 obj = torch.load(path, map_location="cpu")
 
             dt = time.perf_counter() - t0
-            print(json.dumps({"status": "OK", "dt": dt, "type": type(obj).__name__}))
+            payload = {
+                "status": "OK",
+                "dt": dt,
+                "type": type(obj).__name__,
+                "t_import_s": (t_import_done - t0),
+                "t_load_s": (time.perf_counter() - t_import_done),
+            }
         except Exception as e:
             dt = time.perf_counter() - t0
-            print(json.dumps({"status": "ERR", "dt": dt, "err": f"{type(e).__name__}: {e}"}))
+            payload = {"status": "ERR", "dt": dt, "err": f"{type(e).__name__}: {e}"}
+
+        with open(out_path, "w") as f:
+            json.dump(payload, f)
         """
 
-                _stage(items, "subprocess_begin")
+                _stage(items, "subprocess_popen_begin")
                 t0 = time.perf_counter()
 
+                # 不用 capture_output，避免 pipe 卡死；stdout/stderr 丢弃
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", code, p, out_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                _stage(items, "subprocess_popen_done")
+
                 try:
-                    cp = subprocess.run(
-                        [sys.executable, "-c", code, p],
-                        capture_output=True,
-                        text=True,
-                        timeout=load_timeout_s,
-                    )
+                    _stage(items, "subprocess_wait_begin")
+                    proc.wait(timeout=load_timeout_s)
+                    _stage(items, "subprocess_wait_done")
                 except subprocess.TimeoutExpired:
+                    _stage(items, "torch_load_timeout")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
                     dt_wait = time.perf_counter() - t0
                     items.append(("t_wait_s", f"{dt_wait:.4f}"))
                     items.append(("T_TIMEOUT", f"torch.load exceeded {load_timeout_s}s; subprocess killed"))
@@ -501,33 +525,24 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
 
                 dt_wait = time.perf_counter() - t0
                 items.append(("t_wait_s", f"{dt_wait:.4f}"))
-                _stage(items, "subprocess_done")
 
-                # Parse child's JSON output (use last non-empty stdout line)
-                out_lines = (cp.stdout or "").splitlines()
-                last = ""
-                for line in reversed(out_lines):
-                    if line.strip():
-                        last = line.strip()
-                        break
-
-                if not last:
-                    items.append(("T_FAIL", "No JSON output from subprocess"))
-                    items.append(("stderr_tail", (cp.stderr or "")[-400:]))
+                # Read child result file
+                if not os.path.exists(out_path):
+                    items.append(("T_FAIL", "Subprocess finished but output file missing"))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items)
 
-                try:
-                    payload = json.loads(last)
-                except Exception:
-                    items.append(("T_FAIL", "Failed to parse JSON from subprocess"))
-                    items.append(("stdout_tail", (cp.stdout or "")[-400:]))
-                    items.append(("stderr_tail", (cp.stderr or "")[-400:]))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items)
+                with open(out_path, "r") as f:
+                    payload = json.load(f)
 
                 items.append(("torch_load_status", str(payload.get("status"))))
-                items.append(("t_torch_load_s", f"{float(payload.get('dt', 0.0)):.4f}"))
+                items.append(("t_torch_total_s", f"{float(payload.get('dt', 0.0)):.4f}"))
+
+                # Extra breakdown (very useful)
+                if "t_import_s" in payload:
+                    items.append(("t_child_import_torch_s", f"{float(payload.get('t_import_s', 0.0)):.4f}"))
+                if "t_load_s" in payload:
+                    items.append(("t_child_torch_load_s", f"{float(payload.get('t_load_s', 0.0)):.4f}"))
 
                 if payload.get("status") == "OK":
                     items.append(("torch_load_type", str(payload.get("type"))))
