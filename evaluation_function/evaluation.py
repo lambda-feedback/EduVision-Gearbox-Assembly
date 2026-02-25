@@ -403,7 +403,8 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             return _result(False, items)
 
         # ----------------------------
-        # torch.load only (bypass ultralytics) WITH HARD TIMEOUT (<10s cold-start safe)
+        # torch.load only (bypass ultralytics) WITH HARD TIMEOUT
+        # Uses subprocess instead of multiprocessing to avoid SemLock (/dev/shm) issues.
         # ----------------------------
         if diag == "torch_load_only":
             try:
@@ -420,76 +421,105 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 p = found[0]
                 items.append(("model_path", p))
 
-                # We enforce a strict timeout so the platform doesn't hard-timeout with no JSON.
-                # Keep this comfortably below 10s. (Default: 6.5s)
+                # Keep comfortably below 10s cold-start limit
                 load_timeout_s = float(os.environ.get("LF_TORCHLOAD_TIMEOUT_S", "6.5"))
                 items.append(("torchload_timeout_s", str(load_timeout_s)))
 
-                # Import multiprocessing only inside this diag (won't affect cold-start for normal runs)
-                import multiprocessing as mp
-                import queue as _queue  # for Empty
+                import subprocess
+                import json
 
-                # Use spawn for safety in container/serverless environments
-                try:
-                    mp.set_start_method("spawn", force=True)
-                except Exception:
-                    pass
+                # Tiny snippet executed in a separate process:
+                # - imports torch inside the child
+                # - runs torch.load with weights_only when supported
+                # - prints ONE JSON line to stdout
+                code = r"""
+        import time, json, sys
+        t0 = time.perf_counter()
+        try:
+            import torch
+            try:
+                torch.set_num_threads(1)
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
 
-                q: mp.Queue = mp.Queue()
-                proc = mp.Process(target=_torch_load_worker, args=(p, q), daemon=True)
+            path = sys.argv[1]
 
-                _stage(items, "torch_load_spawn_begin")
+            # Prefer safer/lighter load if supported (PyTorch >= 2.0-ish)
+            try:
+                obj = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                obj = torch.load(path, map_location="cpu")
+
+            dt = time.perf_counter() - t0
+            print(json.dumps({"status": "OK", "dt": dt, "type": type(obj).__name__}))
+        except Exception as e:
+            dt = time.perf_counter() - t0
+            print(json.dumps({"status": "ERR", "dt": dt, "err": f"{type(e).__name__}: {e}"}))
+        """
+
+                _stage(items, "subprocess_begin")
                 t0 = time.perf_counter()
-                proc.start()
-                _stage(items, "torch_load_spawn_done")
 
-                _stage(items, "torch_load_wait_begin")
-                proc.join(timeout=load_timeout_s)
+                try:
+                    cp = subprocess.run(
+                        [sys.executable, "-c", code, p],
+                        capture_output=True,
+                        text=True,
+                        timeout=load_timeout_s,
+                    )
+                except subprocess.TimeoutExpired:
+                    dt_wait = time.perf_counter() - t0
+                    items.append(("t_wait_s", f"{dt_wait:.4f}"))
+                    items.append(("T_TIMEOUT", f"torch.load exceeded {load_timeout_s}s; subprocess killed"))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items)
+
                 dt_wait = time.perf_counter() - t0
                 items.append(("t_wait_s", f"{dt_wait:.4f}"))
+                _stage(items, "subprocess_done")
 
-                if proc.is_alive():
-                    _stage(items, "torch_load_timeout")
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                    try:
-                        proc.join(timeout=0.5)
-                    except Exception:
-                        pass
-                    items.append(("T_TIMEOUT", f"torch.load exceeded {load_timeout_s}s; child process terminated"))
+                # Parse child's JSON output (use last non-empty stdout line)
+                out_lines = (cp.stdout or "").splitlines()
+                last = ""
+                for line in reversed(out_lines):
+                    if line.strip():
+                        last = line.strip()
+                        break
+
+                if not last:
+                    items.append(("T_FAIL", "No JSON output from subprocess"))
+                    items.append(("stderr_tail", (cp.stderr or "")[-400:]))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items)
 
-                _stage(items, "torch_load_joined")
-
-                # Collect result from child
                 try:
-                    status, dt_load, payload = q.get_nowait()
+                    payload = json.loads(last)
                 except Exception:
-                    status, dt_load, payload = ("ERR", dt_wait, "No result from child queue")
+                    items.append(("T_FAIL", "Failed to parse JSON from subprocess"))
+                    items.append(("stdout_tail", (cp.stdout or "")[-400:]))
+                    items.append(("stderr_tail", (cp.stderr or "")[-400:]))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items)
 
-                items.append(("torch_load_status", str(status)))
-                items.append(("t_torch_load_s", f"{float(dt_load):.4f}"))
+                items.append(("torch_load_status", str(payload.get("status"))))
+                items.append(("t_torch_load_s", f"{float(payload.get('dt', 0.0)):.4f}"))
 
-                if status == "OK":
-                    items.append(("torch_load_type", str(payload)))
+                if payload.get("status") == "OK":
+                    items.append(("torch_load_type", str(payload.get("type"))))
                     _stage(items, "torch_load_done")
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items)
                 else:
-                    items.append(("T_FAIL", str(payload)))
+                    items.append(("T_FAIL", str(payload.get("err"))))
                     _stage(items, "torch_load_failed")
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items)
+
+                _add_common_timing(items, t_handler0)
+                return _result(False, items)
 
             except Exception:
                 items.append(("T_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items)
-
         # ----------------------------
         # From here: need response/url to do load-check or infer.
         # Keep original CI behaviour: bad URL => LOAD_FAIL.
