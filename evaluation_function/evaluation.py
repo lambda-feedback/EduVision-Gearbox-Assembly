@@ -234,7 +234,25 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             _stage(items, "ping_ok")
             _add_common_timing(items, t_handler0)
             return _result(False, items)
+        # ----------------------------
+        # Sleep diagnostic (time limit test)
+        # ----------------------------
+        if diag == "sleep":
+            try:
+                t = float(_pget(params, "t", 5.0))  # default 5s
+                items.append(("sleep_requested_s", str(t)))
 
+                t0 = time.perf_counter()
+                time.sleep(t)
+                dt = time.perf_counter() - t0
+
+                items.append(("sleep_actual_s", f"{dt:.4f}"))
+                return _result(False, items)
+
+            except Exception:
+                items.append(("SLEEP_FAIL", "see TRACEBACK"))
+                items.append(("TRACEBACK", _tb_short()))
+                return _result(False, items)
         # ----------------------------
         # mem
         # ----------------------------
