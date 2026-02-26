@@ -4,8 +4,7 @@ import os
 import sys
 import time
 import traceback
-import faulthandler
-from typing import Any, List, Tuple, Optional, Callable
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
 import cv2
@@ -14,24 +13,44 @@ import requests
 
 from lf_toolkit.evaluation import Result, Params
 
-# Lazy loading
-from evaluation_function.lazy_load import LazyModule
+# --- Optional image upload support (depends on lf_toolkit version) ---
+try:
+    from lf_toolkit.evaluation.image_upload import upload_image, ImageUploadError  # type: ignore
+except Exception:
+    upload_image = None  # type: ignore
 
-torch = LazyModule("torch")
-ultralytics = LazyModule("ultralytics")
-_MODULE_IMPORT_T0 = time.perf_counter()
+    class ImageUploadError(Exception):  # type: ignore
+        pass
 
-# ---- Old caps (kept, but UI output is now minimal by default) ----
-_MAX_ITEMS = int(os.environ.get("LF_MAX_ITEMS", "40"))
-_MAX_TB_CHARS = int(os.environ.get("LF_MAX_TB_CHARS", "1200"))
 
-# ---- NEW: hard cap for feedback line ----
-_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "160"))
-# If true, force minimal response even if params don't request it
-_MINIMAL_DEFAULT = os.environ.get("LF_UI_MINIMAL_DEFAULT", "1").strip().lower() not in ("0", "false", "no")
+# ----------------------------
+# Pipeline import guard
+# ----------------------------
+PIPELINE_IMPORT_ERROR: Optional[Dict[str, str]] = None
+run_yolo_pipeline = None
+
+try:
+    from .yolo_pipeline import run_yolo_pipeline  # type: ignore
+except Exception as e:
+    PIPELINE_IMPORT_ERROR = {
+        "stage": "IMPORT",
+        "error_code": "E_PIPELINE_IMPORT",
+        "exc_type": type(e).__name__,
+        "message": str(e),
+        "traceback": traceback.format_exc(),
+    }
+    run_yolo_pipeline = None
+
+
+# ----------------------------
+# Output caps (avoid UI freeze)
+# ----------------------------
+_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "1200"))  # keep moderate
+_MAX_LINES = int(os.environ.get("LF_MAX_LINES", "40"))  # cap lines shown
 
 
 def _pget(params: Params, key: str, default: Any) -> Any:
+    """Params in lf_toolkit is dict-like; keep safe across versions."""
     try:
         return params.get(key, default)  # type: ignore
     except Exception:
@@ -39,164 +58,6 @@ def _pget(params: Params, key: str, default: Any) -> Any:
             return params[key]  # type: ignore
         except Exception:
             return default
-
-
-def _escape_html(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _tb_short() -> str:
-    tb = traceback.format_exc()
-    if len(tb) > _MAX_TB_CHARS:
-        tb = tb[:_MAX_TB_CHARS] + "\n... (truncated)"
-    return _escape_html(tb).replace("\n", "<br>")
-
-
-def _items_to_html(items: List[Tuple[Any, Any]]) -> str:
-    # cap output to avoid frontend freeze (kept for completeness)
-    show = items[:_MAX_ITEMS]
-    lines: List[str] = []
-    for k, v in show:
-        k = "" if k is None else str(k).strip()
-        v = "" if v is None else str(v).strip()
-        lines.append(f"{k}: {v}" if k else v)
-    if len(items) > _MAX_ITEMS:
-        lines.append(f"... (items truncated: showing {_MAX_ITEMS}/{len(items)})")
-    return "<br>".join(lines)
-
-
-def _short_feedback(is_correct: bool, items: List[Tuple[Any, Any]]) -> str:
-    """
-    Build a tiny single-line message for UI.
-    Priority: explicit FAIL/TIMEOUT/UNHANDLED keys (from the end), else OK/FAIL.
-    """
-    if is_correct:
-        return "OK"
-
-    # Scan from the end for useful error markers
-    for k, v in reversed(items):
-        ks = ("" if k is None else str(k)).strip()
-        vs = ("" if v is None else str(v)).strip()
-        upper_k = ks.upper()
-
-        if (
-            "FAIL" in upper_k
-            or "TIMEOUT" in upper_k
-            or upper_k in ("UNHANDLED", "ERROR", "EXCEPTION")
-        ):
-            msg = ks if not vs else f"{ks}: {vs}"
-            msg = msg.replace("\n", " ").strip()
-            if len(msg) > _MAX_FEEDBACK_CHARS:
-                msg = msg[:_MAX_FEEDBACK_CHARS] + "..."
-            return msg
-
-    # fallback if nothing obvious
-    return "FAIL"
-
-
-def _result(
-    is_correct: bool,
-    items: List[Tuple[str, str]],
-    *,
-    ui_minimum: bool = False,
-    no_items: bool = False,
-) -> Result:
-    """
-    Version-tolerant minimal output:
-    - Prefer Result(feedback="...") when supported.
-    - Fallback to Result(feedback_items=[(...)] ) for older lf_toolkit versions
-      (so `to_dict()["feedback"]` is non-empty and tests can match LOAD_FAIL).
-    """
-    if _MINIMAL_DEFAULT:
-        ui_minimum = True
-        no_items = True
-
-    msg = _short_feedback(is_correct, items)
-
-    # Derive a "key" so tests can match e.g. "LOAD_FAIL"
-    # If msg looks like "LOAD_FAIL: blah", key becomes "LOAD_FAIL"
-    key = "OK" if is_correct else "FAIL"
-    if ":" in msg:
-        k0 = msg.split(":", 1)[0].strip()
-        if k0:
-            key = k0
-
-    # Newer lf_toolkit: feedback supported
-    try:
-        return Result(is_correct=is_correct, feedback=msg)
-    except TypeError:
-        pass
-
-    # Older lf_toolkit: feedback_items supported; to_dict() often exposes it as "feedback" list
-    try:
-        return Result(is_correct=is_correct, feedback_items=[(key, msg)])
-    except TypeError:
-        # Last resort
-        return Result(is_correct=is_correct)
-
-
-def _timeit(fn: Callable[[], Any]) -> Tuple[Any, float]:
-    """Measure wall time of fn() using perf_counter()."""
-    t0 = time.perf_counter()
-    out = fn()
-    dt = time.perf_counter() - t0
-    return out, dt
-
-
-def _stage(items: List[Tuple[str, str]], name: str) -> None:
-    # short stage marker for locating hang points
-    items.append(("stage", name))
-
-
-# ----------------------------
-# Watchdog for hangs (CloudWatch-friendly)
-# ----------------------------
-def _watchdog_start(seconds: int = 6) -> None:
-    """
-    Dump traceback of ALL threads to stderr after `seconds`.
-    In AWS Lambda, stderr goes to CloudWatch, so even if the function times out,
-    you'll still see where it was stuck.
-    """
-    try:
-        faulthandler.enable(all_threads=True, file=sys.stderr)
-        faulthandler.dump_traceback_later(seconds, repeat=True, file=sys.stderr, exit=False)
-    except Exception:
-        pass
-
-
-def _watchdog_stop() -> None:
-    try:
-        faulthandler.cancel_dump_traceback_later()
-    except Exception:
-        pass
-
-
-def _torch_load_worker(model_path: str, q) -> None:
-    """
-    Run torch.load in a child process so the parent can enforce a timeout.
-    NOTE: Import torch INSIDE the worker to avoid increasing cold-start time.
-    """
-    import time as _t
-    t0 = _t.perf_counter()
-    try:
-        import torch as _torch
-
-        try:
-            _torch.set_num_threads(1)
-            _torch.set_num_interop_threads(1)
-        except Exception:
-            pass
-
-        try:
-            obj = _torch.load(model_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            obj = _torch.load(model_path, map_location="cpu")
-
-        dt = _t.perf_counter() - t0
-        q.put(("OK", dt, type(obj).__name__))
-    except Exception as e:
-        dt = _t.perf_counter() - t0
-        q.put(("ERR", dt, f"{type(e).__name__}: {e}"))
 
 
 def file_url_to_local_path(url: str) -> str:
@@ -208,6 +69,12 @@ def file_url_to_local_path(url: str) -> str:
 
 
 def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Load image into OpenCV BGR ndarray from:
+      - http(s) URL (platform-hosted)
+      - file:// URL (local dev only)
+    Returns (img_bgr, err_message).
+    """
     try:
         if not isinstance(url, str) or not url:
             return None, "Empty URL."
@@ -216,10 +83,11 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
             local_path = file_url_to_local_path(url)
             img = cv2.imread(local_path, cv2.IMREAD_COLOR)
             if img is None:
-                return None, f"cv2.imread failed for local_path='{local_path}'"
+                return None, f"cv2.imread failed: {local_path}"
             return img, None
 
         if url.startswith("http://") or url.startswith("https://"):
+            # safer timeouts: (connect, read)
             resp = requests.get(url, timeout=(5, timeout))
             resp.raise_for_status()
             data = np.frombuffer(resp.content, dtype=np.uint8)
@@ -233,572 +101,250 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
         return None, str(e)
 
 
-def _candidate_model_paths() -> List[str]:
-    """
-    Matches your repo layout:
-      evaluation_function/gear_model.pt
-      evaluation_function/shaft_model.pt
-    In container:
-      /app/evaluation_function/gear_model.pt
-      /app/evaluation_function/shaft_model.pt
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    return [
-        os.path.join(here, "gear_model.pt"),
-        os.path.join(here, "shaft_model.pt"),
-        "/app/evaluation_function/gear_model.pt",
-        "/app/evaluation_function/shaft_model.pt",
-    ]
+def _cv2_bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        raise ValueError("Failed to encode image as PNG.")
+    return buf.tobytes()
 
 
-def _add_common_timing(items: List[Tuple[str, str]], t_handler0: float) -> None:
-    now = time.perf_counter()
-    items.append(("t_module_import_to_handler_s", f"{now - _MODULE_IMPORT_T0:.4f}"))
-    items.append(("t_handler_elapsed_s", f"{now - t_handler0:.4f}"))
+def _truncate_lines(lines: List[str]) -> List[str]:
+    if len(lines) > _MAX_LINES:
+        lines = lines[:_MAX_LINES] + [f"... (truncated, showing {_MAX_LINES} lines)"]
+    return lines
+
+
+def _truncate_text(s: str) -> str:
+    s = s.strip()
+    if len(s) > _MAX_FEEDBACK_CHARS:
+        s = s[:_MAX_FEEDBACK_CHARS] + " ... (truncated)"
+    return s
+
+
+def _result_minimal(is_correct: bool, message: str) -> Result:
+    """
+    Return Result in a version-tolerant minimal way:
+    - Prefer Result(feedback="...") if supported.
+    - Fallback to Result(feedback_items=[(...)] ) for older lf_toolkit versions.
+      (keeps unit tests that look for LOAD_FAIL etc.)
+    """
+    msg = _truncate_text(message)
+
+    # Extract a key for legacy feedback_items
+    key = "OK" if is_correct else "FAIL"
+    if ":" in msg:
+        k0 = msg.split(":", 1)[0].strip()
+        if k0:
+            key = k0
+
+    try:
+        return Result(is_correct=is_correct, feedback=msg)
+    except TypeError:
+        # Older lf_toolkit: feedback not supported
+        try:
+            return Result(is_correct=is_correct, feedback_items=[(key, msg)])
+        except TypeError:
+            return Result(is_correct=is_correct)
+
+
+def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
+    """
+    Convert pipeline output into the HUD-like lines you want.
+    We try multiple possible keys to be robust across your pipeline versions.
+    """
+    lines: List[str] = []
+
+    # --- summary / counts ---
+    summary = out.get("summary") if isinstance(out.get("summary"), dict) else {}
+    ratio = out.get("ratio") if isinstance(out.get("ratio"), dict) else {}
+    errors = out.get("errors") if isinstance(out.get("errors"), list) else []
+
+    # Try to pull common fields (robust)
+    gears_total = summary.get("gears_detected", summary.get("gear_count", summary.get("gears", None)))
+    shafts_total = summary.get("shafts_detected", summary.get("shaft_count", summary.get("shafts", None)))
+    spacers_total = summary.get("spacers_detected", summary.get("spacer_count", summary.get("spacers", None)))
+    mesh_count = summary.get("mesh_count", None)
+    mismesh_count = summary.get("mismesh_count", None)
+
+    big_count = summary.get("gear_big_count", summary.get("big_gears", None))
+    small_count = summary.get("gear_small_count", summary.get("small_gears", None))
+
+    stages = ratio.get("stages_computed", ratio.get("num_stages", None))
+    total_ratio = ratio.get("total_ratio", ratio.get("R_total", None))
+    out_rpm = ratio.get("output_rpm", ratio.get("out_rpm", None))
+    motor_rpm = ratio.get("motor_rpm", ratio.get("MOTOR_RPM", None))
+
+    per_stage = ratio.get("per_stage", ratio.get("stages", None))
+
+    # Header lines
+    if gears_total is not None:
+        lines.append(f"Gears detected: {gears_total}")
+    if shafts_total is not None:
+        lines.append(f"Shafts detected: {shafts_total}")
+    if spacers_total is not None:
+        lines.append(f"Spacers detected: {spacers_total}")
+    if big_count is not None or small_count is not None:
+        if big_count is not None:
+            lines.append(f"Big gears: {big_count}")
+        if small_count is not None:
+            lines.append(f"Small gears: {small_count}")
+
+    # Mesh/mismesh
+    if mesh_count is not None or mismesh_count is not None:
+        if mesh_count is not None:
+            lines.append(f"Mesh count: {mesh_count}")
+        if mismesh_count is not None:
+            lines.append(f"Mismesh count: {mismesh_count}")
+
+    # Ratio section
+    if stages is not None:
+        lines.append(f"Stages (computed): {stages}")
+
+    if total_ratio is None or out_rpm is None:
+        lines.append("Total gear ratio (slowdown): N/A")
+        lines.append("Output shaft speed: N/A")
+    else:
+        try:
+            lines.append(f"Total gear ratio (slowdown): {float(total_ratio):.3f}")
+        except Exception:
+            lines.append(f"Total gear ratio (slowdown): {total_ratio}")
+
+        # motor rpm optional
+        if motor_rpm is not None:
+            try:
+                lines.append(f"Output shaft speed: {float(out_rpm):.1f} RPM (motor={float(motor_rpm):.0f})")
+            except Exception:
+                lines.append(f"Output shaft speed: {out_rpm} RPM (motor={motor_rpm})")
+        else:
+            try:
+                lines.append(f"Output shaft speed: {float(out_rpm):.1f} RPM")
+            except Exception:
+                lines.append(f"Output shaft speed: {out_rpm} RPM")
+
+        # per-stage details
+        if isinstance(per_stage, list):
+            for s in per_stage:
+                # accept tuple/list like (stage, R, z1, z2) or dict
+                if isinstance(s, (tuple, list)) and len(s) >= 4:
+                    stg, R, z1, z2 = s[0], s[1], s[2], s[3]
+                    try:
+                        lines.append(f"Stage{int(stg)}: {int(z2)}/{int(z1)} = {float(R):.2f}")
+                    except Exception:
+                        lines.append(f"Stage{stg}: {z2}/{z1} = {R}")
+                elif isinstance(s, dict):
+                    stg = s.get("stage", s.get("s", "?"))
+                    z1 = s.get("z1", "?")
+                    z2 = s.get("z2", "?")
+                    R = s.get("ratio", s.get("R", "?"))
+                    lines.append(f"Stage{stg}: {z2}/{z1} = {R}")
+
+    # Issues
+    if isinstance(errors, list) and errors:
+        lines.append("---- ISSUES ----")
+        for e in errors:
+            if isinstance(e, dict):
+                msg = str(e.get("message", "")).strip()
+                if msg:
+                    lines.append(msg)
+                else:
+                    code = str(e.get("code", "E_ERR"))
+                    lines.append(f"{code}")
+            else:
+                lines.append(str(e))
+    else:
+        lines.append("Issues: None")
+
+    return lines
 
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
-    Minimal UI payload (single line), keep diagnostics and stage markers.
-    diag:
-      "ping" | "mem" | "torch_min" | "ultra_min" | "torch" | "ultralytics"
-      "model_exists" | "stat_model" | "read_head" | "torch_load_only"
-      "load_model_only" | "load_model" | "infer_once"
+    Platform entry:
+      response = [{"url": "...", ...}, ...]
+    Output:
+      - Plain text feedback (multi-line, capped)
+      - Optional: uploads det/label images (returns URLs as plain text lines)
     """
-    items: List[Tuple[str, str]] = []
-    t_handler0 = time.perf_counter()
+    t0 = time.perf_counter()
 
-    # Defaults switched to True to prevent UI freeze even if caller doesn't pass params
-    ui_minimum: bool = bool(_pget(params, "ui_minimum", True))
-    no_items: bool = bool(_pget(params, "no_items", True))
+    # If pipeline failed to import, return minimal error (short, non-HTML)
+    if run_yolo_pipeline is None:
+        err = PIPELINE_IMPORT_ERROR or {}
+        msg = f"E_PIPELINE_IMPORT: {err.get('exc_type', 'ImportError')}: {err.get('message', 'pipeline import failed')}"
+        return _result_minimal(False, msg)
 
+    # Validate input
+    if not isinstance(response, list) or len(response) == 0:
+        return _result_minimal(False, "BAD_INPUT: Please upload at least one image.")
+
+    first = response[0] if isinstance(response[0], dict) else None
+    url = first.get("url") if isinstance(first, dict) else None
+    if not url:
+        return _result_minimal(False, "LOAD_FAIL: first image has no url field")
+
+    # Controls (keep minimal; no debug spam)
+    return_images: bool = bool(_pget(params, "return_images", True))  # you want detection image
+    gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
+    shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
+
+    # Load image
+    img_bgr, err = _load_bgr_image_from_url(str(url))
+    if img_bgr is None:
+        return _result_minimal(False, f"LOAD_FAIL: Failed to load image ({err})")
+
+    # Run pipeline (single image)
     try:
-        fast_return: bool = bool(_pget(params, "fast_return", True))
-        echo: bool = bool(_pget(params, "echo", False))          # default False now
-        try_fetch: bool = bool(_pget(params, "try_fetch", False))
-        debug: bool = bool(_pget(params, "debug", True))
-        skip_load_check: bool = bool(_pget(params, "skip_load_check", False))
-
-        diag: str = str(_pget(params, "diag", "none") or "none").strip().lower()
-
-        # Keep a couple of tiny markers (safe)
-        items.append(("diag", diag))
-        items.append(("debug", str(debug)))
-        _add_common_timing(items, t_handler0)
-        _stage(items, "entered")
-
-        # ----------------------------
-        # ping
-        # ----------------------------
-        if diag == "ping":
-            _stage(items, "ping_ok")
-            _add_common_timing(items, t_handler0)
-            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # Sleep diagnostic (time limit test)
-        # ----------------------------
-        if diag == "sleep":
-            try:
-                t = float(_pget(params, "t", 5.0))
-                _stage(items, "sleep_begin")
-                t0 = time.perf_counter()
-                time.sleep(t)
-                dt = time.perf_counter() - t0
-                items.append(("sleep_actual_s", f"{dt:.4f}"))
-                _stage(items, "sleep_done")
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("SLEEP_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # mem
-        # ----------------------------
-        if diag == "mem":
-            try:
-                import platform
-                import resource
-
-                # keep it short
-                rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                items.append(("platform", platform.system()))
-                items.append(("python", platform.python_version()))
-                items.append(("ru_maxrss_kb", str(rss)))
-                _stage(items, "mem_ok")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("MEM_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # torch minimal import
-        # ----------------------------
-        if diag == "torch_min":
-            try:
-                _stage(items, "torch_min_begin")
-                _, dt = _timeit(lambda: __import__("torch"))
-                items.append(("t_torch_import_s", f"{dt:.4f}"))
-                _stage(items, "torch_min_done")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("A0_torch_min_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # ultralytics minimal import
-        # ----------------------------
-        if diag == "ultra_min":
-            try:
-                _stage(items, "ultra_min_begin")
-                _, dt = _timeit(lambda: __import__("ultralytics"))
-                items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
-                _stage(items, "ultra_min_done")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("B0_ultra_min_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # torch lazy import
-        # ----------------------------
-        if diag == "torch":
-            try:
-                _stage(items, "torch_lazy_begin")
-                _, dt = _timeit(lambda: torch.__version__)
-                items.append(("t_torch_import_s", f"{dt:.4f}"))
-                _stage(items, "torch_lazy_done")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("A_torch_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # ultralytics lazy import
-        # ----------------------------
-        if diag == "ultralytics":
-            try:
-                _stage(items, "ultra_lazy_begin")
-                YOLO, dt = _timeit(lambda: ultralytics.YOLO)
-                _ = YOLO  # keep lint quiet
-                items.append(("t_ultralytics_symbol_s", f"{dt:.4f}"))
-                _stage(items, "ultra_lazy_done")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("B_ultralytics_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # model existence
-        # ----------------------------
-        if diag == "model_exists":
-            _stage(items, "model_exists_begin")
-            paths = _candidate_model_paths()
-            any_found = False
-            for p in paths:
-                if os.path.exists(p):
-                    any_found = True
-                    items.append(("FOUND", os.path.basename(p)))
-            if not any_found:
-                items.append(("C_FAIL", "No model files found"))
-            _stage(items, "model_exists_done")
-            _add_common_timing(items, t_handler0)
-            return _result(any_found, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # model stat (size/mtime)
-        # ----------------------------
-        if diag == "stat_model":
-            _stage(items, "stat_model_begin")
-            paths = _candidate_model_paths()
-            found = [p for p in paths if os.path.exists(p)]
-            if not found:
-                items.append(("S_FAIL", "No model file found"))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-            p = found[0]
-            st = os.stat(p)
-            items.append(("size_bytes", str(st.st_size)))
-            items.append(("mtime", str(st.st_mtime)))
-            _stage(items, "stat_model_done")
-            _add_common_timing(items, t_handler0)
-            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # read first N bytes (pure file I/O speed)
-        # ----------------------------
-        if diag == "read_head":
-            _stage(items, "read_head_begin")
-            paths = _candidate_model_paths()
-            found = [p for p in paths if os.path.exists(p)]
-            if not found:
-                items.append(("R_FAIL", "No model file found"))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-            p = found[0]
-
-            def _read():
-                with open(p, "rb") as f:
-                    return f.read(1024 * 1024)  # 1MB
-
-            data, dt = _timeit(_read)
-            items.append(("t_read_1mb_s", f"{dt:.4f}"))
-            items.append(("read_len", str(len(data))))
-            _stage(items, "read_head_done")
-            _add_common_timing(items, t_handler0)
-            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # subprocess smoke
-        # ----------------------------
-        if diag == "subprocess_smoke":
-            try:
-                import subprocess
-                _stage(items, "subprocess_smoke_begin")
-                t0 = time.perf_counter()
-                cp = subprocess.run(
-                    [sys.executable, "-c", "print('OK')"],
-                    capture_output=True,
-                    text=True,
-                    timeout=2.0,
-                )
-                items.append(("rc", str(cp.returncode)))
-                dt = time.perf_counter() - t0
-                items.append(("t_smoke_s", f"{dt:.4f}"))
-                _stage(items, "subprocess_smoke_done")
-                _add_common_timing(items, t_handler0)
-                return _result(cp.returncode == 0, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                items.append(("SUBPROC_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # torch.load only (bypass ultralytics) WITH HARD TIMEOUT (robust)
-        # ----------------------------
-        if diag == "torch_load_only":
-            try:
-                _stage(items, "torch_load_only_begin")
-
-                paths = _candidate_model_paths()
-                found = [p for p in paths if os.path.exists(p)]
-                if not found:
-                    items.append(("T_FAIL", "No model file found"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                p = found[0]
-
-                load_timeout_s = float(os.environ.get("LF_TORCHLOAD_TIMEOUT_S", "6.5"))
-                items.append(("torchload_timeout_s", str(load_timeout_s)))
-
-                import subprocess
-                import json
-                import uuid
-
-                out_path = f"/tmp/torchload_{uuid.uuid4().hex}.json"
-
-                code = r"""
-import time, json, sys, os
-t0 = time.perf_counter()
-path = sys.argv[1]
-out_path = sys.argv[2]
-try:
-    import torch
-    try:
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
-
-    t_import_done = time.perf_counter()
-
-    try:
-        obj = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        obj = torch.load(path, map_location="cpu")
-
-    dt = time.perf_counter() - t0
-    payload = {
-        "status": "OK",
-        "dt": dt,
-        "type": type(obj).__name__,
-        "t_import_s": (t_import_done - t0),
-        "t_load_s": (time.perf_counter() - t_import_done),
-    }
-except Exception as e:
-    dt = time.perf_counter() - t0
-    payload = {"status": "ERR", "dt": dt, "err": f"{type(e).__name__}: {e}"}
-
-with open(out_path, "w") as f:
-    json.dump(payload, f)
-"""
-
-                _stage(items, "subprocess_popen_begin")
-                t0 = time.perf_counter()
-                proc = subprocess.Popen(
-                    [sys.executable, "-c", code, p, out_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                _stage(items, "subprocess_popen_done")
-
-                try:
-                    _stage(items, "subprocess_wait_begin")
-                    proc.wait(timeout=load_timeout_s)
-                    _stage(items, "subprocess_wait_done")
-                except subprocess.TimeoutExpired:
-                    _stage(items, "torch_load_timeout")
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    dt_wait = time.perf_counter() - t0
-                    items.append(("t_wait_s", f"{dt_wait:.4f}"))
-                    items.append(("T_TIMEOUT", f"torch.load exceeded {load_timeout_s}s; subprocess killed"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                dt_wait = time.perf_counter() - t0
-                items.append(("t_wait_s", f"{dt_wait:.4f}"))
-
-                if not os.path.exists(out_path):
-                    items.append(("T_FAIL", "Subprocess finished but output missing"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                with open(out_path, "r") as f:
-                    payload = json.load(f)
-
-                status = str(payload.get("status", "ERR"))
-                items.append(("torch_load_status", status))
-                items.append(("t_torch_total_s", f"{float(payload.get('dt', 0.0)):.4f}"))
-
-                if status != "OK":
-                    items.append(("T_FAIL", str(payload.get("err", "unknown error"))))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                _stage(items, "torch_load_done")
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-            except Exception:
-                items.append(("T_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # From here: need response/url to do load-check or infer.
-        # Keep original CI behaviour: bad URL => LOAD_FAIL.
-        # ----------------------------
-        if not isinstance(response, list) or len(response) == 0:
-            items.append(("BAD_INPUT", "No images uploaded."))
-            _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        first = response[0] if isinstance(response, list) and len(response) > 0 else None
-        url = first.get("url") if isinstance(first, dict) else None
-
-        if echo:
-            # still safe: echo is off by default
-            items.append(("response_type", type(response).__name__))
-            items.append(("response_len", str(len(response))))
-            items.append(("first_url", str(url)))
-
-        if not url:
-            items.append(("LOAD_FAIL", "first image has no url"))
-            _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        img: Optional[np.ndarray] = None
-        if (not skip_load_check) or try_fetch or diag in ("load_model", "infer_once"):
-            try:
-                _stage(items, "image_load_begin")
-                (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
-                items.append(("t_image_load_s", f"{dt_img:.4f}"))
-                if img is None:
-                    items.append(("LOAD_FAIL", f"Failed to load image ({err})"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                _stage(items, "image_load_done")
-            except Exception:
-                items.append(("LOAD_FAIL", "Exception during image load"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # D0) load model ONLY (no image required)
-        # ----------------------------
-        if diag == "load_model_only":
-            try:
-                _stage(items, "load_model_only_begin")
-
-                _stage(items, "ultralytics_symbol_begin")
-                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
-                _ = YOLO
-                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
-                _stage(items, "ultralytics_symbol_done")
-
-                model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
-                if not model_path:
-                    items.append(("D_FAIL", "No model file found to load"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                try:
-                    _ = torch.__version__
-                    torch.set_num_threads(1)
-                    torch.set_num_interop_threads(1)
-                except Exception:
-                    pass
-
-                _stage(items, "yolo_load_begin")
-                _watchdog_start(6)
-                _, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
-                _watchdog_stop()
-                items.append(("t_model_load_s", f"{dt_load:.4f}"))
-                _stage(items, "yolo_load_done")
-
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-            except Exception:
-                _watchdog_stop()
-                items.append(("D_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # D) load model only (no inference)
-        # ----------------------------
-        if diag == "load_model":
-            try:
-                _stage(items, "ultralytics_symbol_begin")
-                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
-                _ = YOLO
-                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
-                _stage(items, "ultralytics_symbol_done")
-
-                model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
-                if not model_path:
-                    items.append(("D_FAIL", "No model file found to load"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                try:
-                    _ = torch.__version__
-                    torch.set_num_threads(1)
-                    torch.set_num_interop_threads(1)
-                except Exception:
-                    pass
-
-                _stage(items, "yolo_load_begin")
-                _watchdog_start(6)
-                _, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
-                _watchdog_stop()
-                items.append(("t_model_load_s", f"{dt_load:.4f}"))
-                _stage(items, "yolo_load_done")
-
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-            except Exception:
-                _watchdog_stop()
-                items.append(("D_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # E) infer once (minimal)
-        # ----------------------------
-        if diag == "infer_once":
-            try:
-                _stage(items, "ultralytics_symbol_begin")
-                YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
-                _ = YOLO
-                items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
-                _stage(items, "ultralytics_symbol_done")
-
-                model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
-                if not model_path:
-                    items.append(("E_FAIL", "No model file found for inference"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                if img is None:
-                    items.append(("E_FAIL", "Image not loaded (img is None)"))
-                    _add_common_timing(items, t_handler0)
-                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                try:
-                    _ = torch.__version__
-                    torch.set_num_threads(1)
-                    torch.set_num_interop_threads(1)
-                except Exception:
-                    pass
-
-                _stage(items, "yolo_load_begin")
-                _watchdog_start(6)
-                model, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
-                _watchdog_stop()
-                items.append(("t_model_load_s", f"{dt_load:.4f}"))
-                _stage(items, "yolo_load_done")
-
-                _stage(items, "predict_begin")
-                _, dt_pred = _timeit(lambda: model.predict(source=img, imgsz=640, conf=0.25, device="cpu", verbose=False))
-                items.append(("t_predict_s", f"{dt_pred:.4f}"))
-                _stage(items, "predict_done")
-
-                _add_common_timing(items, t_handler0)
-                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-            except Exception:
-                _watchdog_stop()
-                items.append(("E_FAIL", "see TRACEBACK"))
-                items.append(("TRACEBACK", _tb_short()))
-                _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        # ----------------------------
-        # Optional early exit
-        # ----------------------------
-        if fast_return and not try_fetch:
-            items.append(("note", "fast_return=True (no YOLO)"))
-            _add_common_timing(items, t_handler0)
-            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
-        items.append(("note", "No YOLO executed in default path"))
-        _add_common_timing(items, t_handler0)
-        return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
-
+        out: Dict[str, Any] = run_yolo_pipeline(  # type: ignore[misc]
+            img_bgr=img_bgr,
+            gear_model_rel=gear_model_rel,
+            shaft_model_rel=shaft_model_rel,
+            return_images=return_images,
+        )
     except Exception as e:
-        _watchdog_stop()
-        items.append(("UNHANDLED", f"{type(e).__name__}: {e}"))
-        items.append(("TRACEBACK", _tb_short()))
-        _add_common_timing(items, t_handler0)
-        return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+        # minimal, no traceback to UI
+        return _result_minimal(False, f"E_PIPELINE_RUNTIME: {type(e).__name__}: {e}")
+
+    # Build HUD-like feedback lines
+    lines = _build_hud_from_pipeline_output(out)
+
+    # Optional: attach uploaded image links as plain text lines (no HTML)
+    if return_images:
+        imgs = out.get("images") if isinstance(out.get("images"), dict) else {}
+        # expected keys like "det_img", "label_img"
+        det_img = imgs.get("det_img") if isinstance(imgs.get("det_img"), np.ndarray) else None
+        label_img = imgs.get("label_img") if isinstance(imgs.get("label_img"), np.ndarray) else None
+
+        # Only if upload_image is available
+        if upload_image is not None:
+            try:
+                if det_img is not None:
+                    png = _cv2_bgr_to_png_bytes(det_img)
+                    det_url = upload_image(png, "eduvision")  # type: ignore[misc]
+                    lines.append(f"det_img_url: {det_url}")
+                if label_img is not None:
+                    png = _cv2_bgr_to_png_bytes(label_img)
+                    lab_url = upload_image(png, "eduvision")  # type: ignore[misc]
+                    lines.append(f"label_img_url: {lab_url}")
+            except ImageUploadError as e:
+                # keep short
+                lines.append(f"E_UPLOAD_FAIL: {e}")
+            except Exception as e:
+                lines.append(f"E_UPLOAD_FAIL: {type(e).__name__}: {e}")
+        else:
+            # If upload isn't available, still OK — don't spam
+            pass
+
+    # Add a tiny runtime line (1 line only)
+    dt = time.perf_counter() - t0
+    lines.append(f"runtime_s: {dt:.3f}")
+
+    # Cap output
+    lines = _truncate_lines(lines)
+    msg = "\n".join(lines)
+
+    # Decide correctness: any E_* in errors => incorrect
+    errors = out.get("errors") if isinstance(out.get("errors"), list) else []
+    has_E = any(isinstance(e, dict) and str(e.get("code", "")).startswith("E_") for e in errors)
+    is_correct = not has_E
+
+    return _result_minimal(is_correct, msg)
