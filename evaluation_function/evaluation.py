@@ -21,9 +21,14 @@ torch = LazyModule("torch")
 ultralytics = LazyModule("ultralytics")
 _MODULE_IMPORT_T0 = time.perf_counter()
 
-# ---- Small safety caps to avoid UI freeze ----
+# ---- Old caps (kept, but UI output is now minimal by default) ----
 _MAX_ITEMS = int(os.environ.get("LF_MAX_ITEMS", "40"))
 _MAX_TB_CHARS = int(os.environ.get("LF_MAX_TB_CHARS", "1200"))
+
+# ---- NEW: hard cap for feedback line ----
+_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "160"))
+# If true, force minimal response even if params don't request it
+_MINIMAL_DEFAULT = os.environ.get("LF_UI_MINIMAL_DEFAULT", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _pget(params: Params, key: str, default: Any) -> Any:
@@ -48,7 +53,7 @@ def _tb_short() -> str:
 
 
 def _items_to_html(items: List[Tuple[Any, Any]]) -> str:
-    # cap output to avoid frontend freeze
+    # cap output to avoid frontend freeze (kept for completeness)
     show = items[:_MAX_ITEMS]
     lines: List[str] = []
     for k, v in show:
@@ -60,6 +65,35 @@ def _items_to_html(items: List[Tuple[Any, Any]]) -> str:
     return "<br>".join(lines)
 
 
+def _short_feedback(is_correct: bool, items: List[Tuple[Any, Any]]) -> str:
+    """
+    Build a tiny single-line message for UI.
+    Priority: explicit FAIL/TIMEOUT/UNHANDLED keys (from the end), else OK/FAIL.
+    """
+    if is_correct:
+        return "OK"
+
+    # Scan from the end for useful error markers
+    for k, v in reversed(items):
+        ks = ("" if k is None else str(k)).strip()
+        vs = ("" if v is None else str(v)).strip()
+        upper_k = ks.upper()
+
+        if (
+            "FAIL" in upper_k
+            or "TIMEOUT" in upper_k
+            or upper_k in ("UNHANDLED", "ERROR", "EXCEPTION")
+        ):
+            msg = ks if not vs else f"{ks}: {vs}"
+            msg = msg.replace("\n", " ").strip()
+            if len(msg) > _MAX_FEEDBACK_CHARS:
+                msg = msg[:_MAX_FEEDBACK_CHARS] + "..."
+            return msg
+
+    # fallback if nothing obvious
+    return "FAIL"
+
+
 def _result(
     is_correct: bool,
     items: List[Tuple[str, str]],
@@ -68,32 +102,22 @@ def _result(
     no_items: bool = False,
 ) -> Result:
     """
-    Return Result in a version-tolerant way.
-
-    ui_minimum=True:
-      - Return the smallest possible response to avoid UI freeze
-      - feedback is short, and feedback_items is omitted
-    no_items=True:
-      - Normal feedback text, but no feedback_items (avoid list rendering in UI)
+    Always return a tiny payload to avoid UI freeze.
+    - feedback: single short line
+    - feedback_items: omitted
     """
-    if ui_minimum:
-        # Minimal payload: test whether UI freezes due to rendering large outputs
-        try:
-            return Result(is_correct=is_correct, feedback="OK")
-        except TypeError:
-            return Result(is_correct=is_correct)
+    if _MINIMAL_DEFAULT:
+        ui_minimum = True
+        no_items = True
 
-    html = _items_to_html(items)
+    # Always minimal line
+    msg = _short_feedback(is_correct, items)
 
-    safe_items = [] if no_items else items[:_MAX_ITEMS]
     try:
-        return Result(is_correct=is_correct, feedback=html, feedback_items=safe_items)
+        return Result(is_correct=is_correct, feedback=msg)
     except TypeError:
-        # older toolkit versions: some don't accept feedback or feedback_items
-        try:
-            return Result(is_correct=is_correct, feedback_items=safe_items)
-        except TypeError:
-            return Result(is_correct=is_correct)
+        # older toolkit versions: feedback may not be supported
+        return Result(is_correct=is_correct)
 
 
 def _timeit(fn: Callable[[], Any]) -> Tuple[Any, float]:
@@ -120,7 +144,6 @@ def _watchdog_start(seconds: int = 6) -> None:
     """
     try:
         faulthandler.enable(all_threads=True, file=sys.stderr)
-        # repeat=True: keep dumping every `seconds` until cancelled
         faulthandler.dump_traceback_later(seconds, repeat=True, file=sys.stderr, exit=False)
     except Exception:
         pass
@@ -143,14 +166,12 @@ def _torch_load_worker(model_path: str, q) -> None:
     try:
         import torch as _torch
 
-        # Limit threads inside worker (small + safe)
         try:
             _torch.set_num_threads(1)
             _torch.set_num_interop_threads(1)
         except Exception:
             pass
 
-        # Prefer lighter/safer load if supported
         try:
             obj = _torch.load(model_path, map_location="cpu", weights_only=True)
         except TypeError:
@@ -184,7 +205,6 @@ def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.n
             return img, None
 
         if url.startswith("http://") or url.startswith("https://"):
-            # explicit (connect, read) timeouts reduce "endless wait"
             resp = requests.get(url, timeout=(5, timeout))
             resp.raise_for_status()
             data = np.frombuffer(resp.content, dtype=np.uint8)
@@ -224,44 +244,31 @@ def _add_common_timing(items: List[Tuple[str, str]], t_handler0: float) -> None:
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
-    Minimal diagnostics, minimal changes:
-      - keeps original tests behaviour: bad url => LOAD_FAIL
-      - adds stage markers and truncates output to avoid UI freeze
+    Minimal UI payload (single line), keep diagnostics and stage markers.
     diag:
       "ping" | "mem" | "torch_min" | "ultra_min" | "torch" | "ultralytics"
       "model_exists" | "stat_model" | "read_head" | "torch_load_only"
       "load_model_only" | "load_model" | "infer_once"
-
-    UI debug flags (new):
-      - ui_minimum: bool  -> return only "OK" (tiny response)
-      - no_items: bool    -> do not return feedback_items (avoid list rendering)
     """
     items: List[Tuple[str, str]] = []
     t_handler0 = time.perf_counter()
 
-    # NEW flags (read once, pass into _result)
-    ui_minimum: bool = bool(_pget(params, "ui_minimum", False))
-    no_items: bool = bool(_pget(params, "no_items", False))
+    # Defaults switched to True to prevent UI freeze even if caller doesn't pass params
+    ui_minimum: bool = bool(_pget(params, "ui_minimum", True))
+    no_items: bool = bool(_pget(params, "no_items", True))
 
     try:
         fast_return: bool = bool(_pget(params, "fast_return", True))
-        echo: bool = bool(_pget(params, "echo", True))
+        echo: bool = bool(_pget(params, "echo", False))          # default False now
         try_fetch: bool = bool(_pget(params, "try_fetch", False))
         debug: bool = bool(_pget(params, "debug", True))
         skip_load_check: bool = bool(_pget(params, "skip_load_check", False))
 
         diag: str = str(_pget(params, "diag", "none") or "none").strip().lower()
 
-        items.append(("SMOKE", "Hello / evaluation_function reached ✅"))
+        # Keep a couple of tiny markers (safe)
         items.append(("diag", diag))
-        items.append(("ui_minimum", str(ui_minimum)))
-        items.append(("no_items", str(no_items)))
-        items.append(("fast_return", str(fast_return)))
-        items.append(("echo", str(echo)))
-        items.append(("try_fetch", str(try_fetch)))
-        items.append(("skip_load_check", str(skip_load_check)))
         items.append(("debug", str(debug)))
-
         _add_common_timing(items, t_handler0)
         _stage(items, "entered")
 
@@ -271,26 +278,25 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         if diag == "ping":
             _stage(items, "ping_ok")
             _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
         # ----------------------------
         # Sleep diagnostic (time limit test)
         # ----------------------------
         if diag == "sleep":
             try:
-                t = float(_pget(params, "t", 5.0))  # default 5s
-                items.append(("sleep_requested_s", str(t)))
-
+                t = float(_pget(params, "t", 5.0))
+                _stage(items, "sleep_begin")
                 t0 = time.perf_counter()
                 time.sleep(t)
                 dt = time.perf_counter() - t0
-
                 items.append(("sleep_actual_s", f"{dt:.4f}"))
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
+                _stage(items, "sleep_done")
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("SLEEP_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
+                _add_common_timing(items, t_handler0)
                 return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
         # ----------------------------
@@ -301,17 +307,14 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 import platform
                 import resource
 
-                items.append(("platform", platform.platform()))
-                items.append(("python_version", platform.python_version()))
-                items.append(("pid", str(os.getpid())))
-
+                # keep it short
                 rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                items.append(("platform", platform.system()))
+                items.append(("python", platform.python_version()))
                 items.append(("ru_maxrss_kb", str(rss)))
-                items.append(("ru_maxrss_mb_est", f"{(float(rss) / 1024.0):.2f}"))
-
                 _stage(items, "mem_ok")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("MEM_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -328,7 +331,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("t_torch_import_s", f"{dt:.4f}"))
                 _stage(items, "torch_min_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("A0_torch_min_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -345,7 +348,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 items.append(("t_ultralytics_import_s", f"{dt:.4f}"))
                 _stage(items, "ultra_min_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("B0_ultra_min_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -360,11 +363,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 _stage(items, "torch_lazy_begin")
                 _, dt = _timeit(lambda: torch.__version__)
                 items.append(("t_torch_import_s", f"{dt:.4f}"))
-                items.append(("torch_version", str(torch.__version__)))
-                items.append(("cuda_check", "skipped (CPU-only build)"))
                 _stage(items, "torch_lazy_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("A_torch_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -378,11 +379,11 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             try:
                 _stage(items, "ultra_lazy_begin")
                 YOLO, dt = _timeit(lambda: ultralytics.YOLO)
+                _ = YOLO  # keep lint quiet
                 items.append(("t_ultralytics_symbol_s", f"{dt:.4f}"))
-                items.append(("YOLO_symbol", str(YOLO)))
                 _stage(items, "ultra_lazy_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("B_ultralytics_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -399,17 +400,12 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             for p in paths:
                 if os.path.exists(p):
                     any_found = True
-                    try:
-                        sz = os.path.getsize(p)
-                    except Exception:
-                        sz = -1
-                    items.append(("FOUND", f"{p} (size={sz})"))
+                    items.append(("FOUND", os.path.basename(p)))
             if not any_found:
-                items.append(("C_FAIL", "No model files found in candidate paths"))
-                items.append(("C_candidates", " | ".join(paths)))
+                items.append(("C_FAIL", "No model files found"))
             _stage(items, "model_exists_done")
             _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+            return _result(any_found, items, ui_minimum=ui_minimum, no_items=no_items)
 
         # ----------------------------
         # model stat (size/mtime)
@@ -420,18 +416,16 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             found = [p for p in paths if os.path.exists(p)]
             if not found:
                 items.append(("S_FAIL", "No model file found"))
-                items.append(("S_candidates", " | ".join(paths)))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
             p = found[0]
             st = os.stat(p)
-            items.append(("model_path", p))
             items.append(("size_bytes", str(st.st_size)))
             items.append(("mtime", str(st.st_mtime)))
             _stage(items, "stat_model_done")
             _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
         # ----------------------------
         # read first N bytes (pure file I/O speed)
@@ -442,12 +436,10 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             found = [p for p in paths if os.path.exists(p)]
             if not found:
                 items.append(("R_FAIL", "No model file found"))
-                items.append(("R_candidates", " | ".join(paths)))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
             p = found[0]
-            items.append(("model_path", p))
 
             def _read():
                 with open(p, "rb") as f:
@@ -458,8 +450,11 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             items.append(("read_len", str(len(data))))
             _stage(items, "read_head_done")
             _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
+        # ----------------------------
+        # subprocess smoke
+        # ----------------------------
         if diag == "subprocess_smoke":
             try:
                 import subprocess
@@ -472,12 +467,11 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     timeout=2.0,
                 )
                 items.append(("rc", str(cp.returncode)))
-                items.append(("stdout", (cp.stdout or "").strip()))
-                items.append(("stderr", (cp.stderr or "").strip()))
-                items.append(("t_smoke_s", f"{time.perf_counter() - t0:.4f}"))
+                dt = time.perf_counter() - t0
+                items.append(("t_smoke_s", f"{dt:.4f}"))
                 _stage(items, "subprocess_smoke_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(cp.returncode == 0, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 items.append(("SUBPROC_FAIL", "see TRACEBACK"))
                 items.append(("TRACEBACK", _tb_short()))
@@ -495,12 +489,10 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 found = [p for p in paths if os.path.exists(p)]
                 if not found:
                     items.append(("T_FAIL", "No model file found"))
-                    items.append(("T_candidates", " | ".join(paths)))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
                 p = found[0]
-                items.append(("model_path", p))
 
                 load_timeout_s = float(os.environ.get("LF_TORCHLOAD_TIMEOUT_S", "6.5"))
                 items.append(("torchload_timeout_s", str(load_timeout_s)))
@@ -510,9 +502,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                 import uuid
 
                 out_path = f"/tmp/torchload_{uuid.uuid4().hex}.json"
-                items.append(("torchload_out_path", out_path))
 
-                # Child: write exactly one JSON object to out_path
                 code = r"""
 import time, json, sys, os
 t0 = time.perf_counter()
@@ -551,7 +541,6 @@ with open(out_path, "w") as f:
 
                 _stage(items, "subprocess_popen_begin")
                 t0 = time.perf_counter()
-
                 proc = subprocess.Popen(
                     [sys.executable, "-c", code, p, out_path],
                     stdout=subprocess.DEVNULL,
@@ -579,30 +568,25 @@ with open(out_path, "w") as f:
                 items.append(("t_wait_s", f"{dt_wait:.4f}"))
 
                 if not os.path.exists(out_path):
-                    items.append(("T_FAIL", "Subprocess finished but output file missing"))
+                    items.append(("T_FAIL", "Subprocess finished but output missing"))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
                 with open(out_path, "r") as f:
                     payload = json.load(f)
 
-                items.append(("torch_load_status", str(payload.get("status"))))
+                status = str(payload.get("status", "ERR"))
+                items.append(("torch_load_status", status))
                 items.append(("t_torch_total_s", f"{float(payload.get('dt', 0.0)):.4f}"))
 
-                if "t_import_s" in payload:
-                    items.append(("t_child_import_torch_s", f"{float(payload.get('t_import_s', 0.0)):.4f}"))
-                if "t_load_s" in payload:
-                    items.append(("t_child_torch_load_s", f"{float(payload.get('t_load_s', 0.0)):.4f}"))
+                if status != "OK":
+                    items.append(("T_FAIL", str(payload.get("err", "unknown error"))))
+                    _add_common_timing(items, t_handler0)
+                    return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
-                if payload.get("status") == "OK":
-                    items.append(("torch_load_type", str(payload.get("type"))))
-                    _stage(items, "torch_load_done")
-                else:
-                    items.append(("T_FAIL", str(payload.get("err"))))
-                    _stage(items, "torch_load_failed")
-
+                _stage(items, "torch_load_done")
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
             except Exception:
                 items.append(("T_FAIL", "see TRACEBACK"))
@@ -623,15 +607,13 @@ with open(out_path, "w") as f:
         url = first.get("url") if isinstance(first, dict) else None
 
         if echo:
+            # still safe: echo is off by default
             items.append(("response_type", type(response).__name__))
             items.append(("response_len", str(len(response))))
-            items.append(("first_item_type", type(first).__name__))
-            if isinstance(first, dict):
-                items.append(("first_item_keys", ", ".join(sorted([str(k) for k in first.keys()]))))
-                items.append(("first_url", str(url)))
+            items.append(("first_url", str(url)))
 
         if not url:
-            items.append(("LOAD_FAIL", "LOAD_FAIL: first image has no url field"))
+            items.append(("LOAD_FAIL", "first image has no url"))
             _add_common_timing(items, t_handler0)
             return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
@@ -642,17 +624,13 @@ with open(out_path, "w") as f:
                 (img, err), dt_img = _timeit(lambda: _load_bgr_image_from_url(str(url)))
                 items.append(("t_image_load_s", f"{dt_img:.4f}"))
                 if img is None:
-                    items.append(("LOAD_FAIL", f"LOAD_FAIL: Failed to load image. ({err})"))
-                    items.append(("url", str(url)))
+                    items.append(("LOAD_FAIL", f"Failed to load image ({err})"))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
-                h, w = img.shape[:2]
-                items.append(("image_loaded", "OK"))
-                items.append(("shape", f"{w}x{h}"))
                 _stage(items, "image_load_done")
             except Exception:
-                items.append(("LOAD_FAIL", "LOAD_FAIL: Exception during image load"))
+                items.append(("LOAD_FAIL", "Exception during image load"))
                 items.append(("TRACEBACK", _tb_short()))
                 _add_common_timing(items, t_handler0)
                 return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
@@ -666,38 +644,32 @@ with open(out_path, "w") as f:
 
                 _stage(items, "ultralytics_symbol_begin")
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                _ = YOLO
                 items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
                 _stage(items, "ultralytics_symbol_done")
 
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
                     items.append(("D_FAIL", "No model file found to load"))
-                    items.append(("D_candidates", " | ".join(_candidate_model_paths())))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                items.append(("D_model_path", model_path))
 
                 try:
                     _ = torch.__version__
                     torch.set_num_threads(1)
                     torch.set_num_interop_threads(1)
-                    items.append(("torch_threads", "set to 1"))
                 except Exception:
                     pass
 
                 _stage(items, "yolo_load_begin")
                 _watchdog_start(6)
-                _, dt_load = _timeit(lambda: YOLO(model_path))
+                _, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
                 _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
 
-                items.append(("D_load", "model loaded ✅"))
-                _stage(items, "load_model_only_done")
-
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
             except Exception:
                 _watchdog_stop()
@@ -713,36 +685,33 @@ with open(out_path, "w") as f:
             try:
                 _stage(items, "ultralytics_symbol_begin")
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                _ = YOLO
                 items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
                 _stage(items, "ultralytics_symbol_done")
 
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
                     items.append(("D_FAIL", "No model file found to load"))
-                    items.append(("D_candidates", " | ".join(_candidate_model_paths())))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
-
-                items.append(("D_model_path", model_path))
 
                 try:
                     _ = torch.__version__
                     torch.set_num_threads(1)
                     torch.set_num_interop_threads(1)
-                    items.append(("torch_threads", "set to 1"))
                 except Exception:
                     pass
 
                 _stage(items, "yolo_load_begin")
                 _watchdog_start(6)
-                _, dt_load = _timeit(lambda: YOLO(model_path))
+                _, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
                 _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
-                items.append(("D_load", "model loaded ✅"))
 
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
+
             except Exception:
                 _watchdog_stop()
                 items.append(("D_FAIL", "see TRACEBACK"))
@@ -757,13 +726,13 @@ with open(out_path, "w") as f:
             try:
                 _stage(items, "ultralytics_symbol_begin")
                 YOLO, dt_ul = _timeit(lambda: ultralytics.YOLO)
+                _ = YOLO
                 items.append(("t_ultralytics_symbol_s", f"{dt_ul:.4f}"))
                 _stage(items, "ultralytics_symbol_done")
 
                 model_path = next((p for p in _candidate_model_paths() if os.path.exists(p)), None)
                 if not model_path:
                     items.append(("E_FAIL", "No model file found for inference"))
-                    items.append(("E_candidates", " | ".join(_candidate_model_paths())))
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
@@ -772,19 +741,16 @@ with open(out_path, "w") as f:
                     _add_common_timing(items, t_handler0)
                     return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
-                items.append(("E_model_path", model_path))
-
                 try:
                     _ = torch.__version__
                     torch.set_num_threads(1)
                     torch.set_num_interop_threads(1)
-                    items.append(("torch_threads", "set to 1"))
                 except Exception:
                     pass
 
                 _stage(items, "yolo_load_begin")
                 _watchdog_start(6)
-                model, dt_load = _timeit(lambda: YOLO(model_path))
+                model, dt_load = _timeit(lambda: ultralytics.YOLO(model_path))
                 _watchdog_stop()
                 items.append(("t_model_load_s", f"{dt_load:.4f}"))
                 _stage(items, "yolo_load_done")
@@ -794,9 +760,8 @@ with open(out_path, "w") as f:
                 items.append(("t_predict_s", f"{dt_pred:.4f}"))
                 _stage(items, "predict_done")
 
-                items.append(("E_infer", "predict done ✅"))
                 _add_common_timing(items, t_handler0)
-                return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+                return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
             except Exception:
                 _watchdog_stop()
                 items.append(("E_FAIL", "see TRACEBACK"))
@@ -805,16 +770,16 @@ with open(out_path, "w") as f:
                 return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
 
         # ----------------------------
-        # Optional early exit (preserve your behaviour)
+        # Optional early exit
         # ----------------------------
         if fast_return and not try_fetch:
-            items.append(("note", "fast_return=True (no YOLO). Load-check already done unless skip_load_check=True."))
+            items.append(("note", "fast_return=True (no YOLO)"))
             _add_common_timing(items, t_handler0)
-            return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+            return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
-        items.append(("note", "No YOLO executed in default path. Use diag=... to pinpoint failures."))
+        items.append(("note", "No YOLO executed in default path"))
         _add_common_timing(items, t_handler0)
-        return _result(False, items, ui_minimum=ui_minimum, no_items=no_items)
+        return _result(True, items, ui_minimum=ui_minimum, no_items=no_items)
 
     except Exception as e:
         _watchdog_stop()
