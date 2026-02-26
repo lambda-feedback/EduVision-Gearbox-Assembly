@@ -102,21 +102,36 @@ def _result(
     no_items: bool = False,
 ) -> Result:
     """
-    Always return a tiny payload to avoid UI freeze.
-    - feedback: single short line
-    - feedback_items: omitted
+    Version-tolerant minimal output:
+    - Prefer Result(feedback="...") when supported.
+    - Fallback to Result(feedback_items=[(...)] ) for older lf_toolkit versions
+      (so `to_dict()["feedback"]` is non-empty and tests can match LOAD_FAIL).
     """
     if _MINIMAL_DEFAULT:
         ui_minimum = True
         no_items = True
 
-    # Always minimal line
     msg = _short_feedback(is_correct, items)
 
+    # Derive a "key" so tests can match e.g. "LOAD_FAIL"
+    # If msg looks like "LOAD_FAIL: blah", key becomes "LOAD_FAIL"
+    key = "OK" if is_correct else "FAIL"
+    if ":" in msg:
+        k0 = msg.split(":", 1)[0].strip()
+        if k0:
+            key = k0
+
+    # Newer lf_toolkit: feedback supported
     try:
         return Result(is_correct=is_correct, feedback=msg)
     except TypeError:
-        # older toolkit versions: feedback may not be supported
+        pass
+
+    # Older lf_toolkit: feedback_items supported; to_dict() often exposes it as "feedback" list
+    try:
+        return Result(is_correct=is_correct, feedback_items=[(key, msg)])
+    except TypeError:
+        # Last resort
         return Result(is_correct=is_correct)
 
 
