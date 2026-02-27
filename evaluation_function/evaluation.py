@@ -45,8 +45,8 @@ except Exception as e:
 # ----------------------------
 # Output caps (avoid UI freeze)
 # ----------------------------
-#_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "1200"))
-#_MAX_LINES = int(os.environ.get("LF_MAX_LINES", "40"))
+_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "500000"))
+_MAX_LINES = int(os.environ.get("LF_MAX_LINES", "20000"))
 
 
 def _pget(params: Params, key: str, default: Any) -> Any:
