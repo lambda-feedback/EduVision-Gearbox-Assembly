@@ -45,8 +45,8 @@ except Exception as e:
 # ----------------------------
 # Output caps (avoid UI freeze)
 # ----------------------------
-_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "1200"))  # keep moderate
-_MAX_LINES = int(os.environ.get("LF_MAX_LINES", "40"))  # cap lines shown
+_MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "1200"))
+_MAX_LINES = int(os.environ.get("LF_MAX_LINES", "40"))
 
 
 def _pget(params: Params, key: str, default: Any) -> Any:
@@ -108,29 +108,27 @@ def _cv2_bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
-def _truncate_lines(lines: List[str]) -> List[str]:
-    if len(lines) > _MAX_LINES:
-        lines = lines[:_MAX_LINES] + [f"... (truncated, showing {_MAX_LINES} lines)"]
+def _truncate_lines(lines: List[str], max_lines: int) -> List[str]:
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... (truncated, showing {max_lines} lines)"]
     return lines
 
 
-def _truncate_text(s: str) -> str:
+def _truncate_text(s: str, max_chars: int) -> str:
     s = s.strip()
-    if len(s) > _MAX_FEEDBACK_CHARS:
-        s = s[:_MAX_FEEDBACK_CHARS] + " ... (truncated)"
+    if len(s) > max_chars:
+        s = s[:max_chars] + " ... (truncated)"
     return s
 
 
-def _result_minimal(is_correct: bool, message: str) -> Result:
+def _result_minimal(is_correct: bool, message: str, *, max_chars: int = _MAX_FEEDBACK_CHARS) -> Result:
     """
     Return Result in a version-tolerant minimal way:
     - Prefer Result(feedback="...") if supported.
     - Fallback to Result(feedback_items=[(...)] ) for older lf_toolkit versions.
-      (keeps unit tests that look for LOAD_FAIL etc.)
     """
-    msg = _truncate_text(message)
+    msg = _truncate_text(message, max_chars=max_chars)
 
-    # Extract a key for legacy feedback_items
     key = "OK" if is_correct else "FAIL"
     if ":" in msg:
         k0 = msg.split(":", 1)[0].strip()
@@ -140,7 +138,6 @@ def _result_minimal(is_correct: bool, message: str) -> Result:
     try:
         return Result(is_correct=is_correct, feedback=msg)
     except TypeError:
-        # Older lf_toolkit: feedback not supported
         try:
             return Result(is_correct=is_correct, feedback_items=[(key, msg)])
         except TypeError:
@@ -149,17 +146,14 @@ def _result_minimal(is_correct: bool, message: str) -> Result:
 
 def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
     """
-    Convert pipeline output into the HUD-like lines you want.
-    We try multiple possible keys to be robust across your pipeline versions.
+    Convert pipeline output into HUD-like lines.
     """
     lines: List[str] = []
 
-    # --- summary / counts ---
     summary = out.get("summary") if isinstance(out.get("summary"), dict) else {}
     ratio = out.get("ratio") if isinstance(out.get("ratio"), dict) else {}
     errors = out.get("errors") if isinstance(out.get("errors"), list) else []
 
-    # Try to pull common fields (robust)
     gears_total = summary.get("gears_detected", summary.get("gear_count", summary.get("gears", None)))
     shafts_total = summary.get("shafts_detected", summary.get("shaft_count", summary.get("shafts", None)))
     spacers_total = summary.get("spacers_detected", summary.get("spacer_count", summary.get("spacers", None)))
@@ -176,7 +170,6 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
 
     per_stage = ratio.get("per_stage", ratio.get("stages", None))
 
-    # Header lines
     if gears_total is not None:
         lines.append(f"Gears detected: {gears_total}")
     if shafts_total is not None:
@@ -189,14 +182,12 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
         if small_count is not None:
             lines.append(f"Small gears: {small_count}")
 
-    # Mesh/mismesh
     if mesh_count is not None or mismesh_count is not None:
         if mesh_count is not None:
             lines.append(f"Mesh count: {mesh_count}")
         if mismesh_count is not None:
             lines.append(f"Mismesh count: {mismesh_count}")
 
-    # Ratio section
     if stages is not None:
         lines.append(f"Stages (computed): {stages}")
 
@@ -209,7 +200,6 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
         except Exception:
             lines.append(f"Total gear ratio (slowdown): {total_ratio}")
 
-        # motor rpm optional
         if motor_rpm is not None:
             try:
                 lines.append(f"Output shaft speed: {float(out_rpm):.1f} RPM (motor={float(motor_rpm):.0f})")
@@ -221,10 +211,8 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
             except Exception:
                 lines.append(f"Output shaft speed: {out_rpm} RPM")
 
-        # per-stage details
         if isinstance(per_stage, list):
             for s in per_stage:
-                # accept tuple/list like (stage, R, z1, z2) or dict
                 if isinstance(s, (tuple, list)) and len(s) >= 4:
                     stg, R, z1, z2 = s[0], s[1], s[2], s[3]
                     try:
@@ -238,7 +226,6 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
                     R = s.get("ratio", s.get("R", "?"))
                     lines.append(f"Stage{stg}: {z2}/{z1} = {R}")
 
-    # Issues
     if isinstance(errors, list) and errors:
         lines.append("---- ISSUES ----")
         for e in errors:
@@ -257,42 +244,209 @@ def _build_hud_from_pipeline_output(out: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _candidate_model_paths(gear_model_rel: str, shaft_model_rel: str) -> Dict[str, List[str]]:
+    """
+    Try common locations for model files:
+      - alongside this file (evaluation_function/...)
+      - /app/evaluation_function/... inside the container
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    return {
+        "gear": [
+            os.path.join(here, gear_model_rel),
+            os.path.join(here, "gear_model.pt"),
+            f"/app/evaluation_function/{gear_model_rel}",
+            "/app/evaluation_function/gear_model.pt",
+        ],
+        "shaft": [
+            os.path.join(here, shaft_model_rel),
+            os.path.join(here, "shaft_model.pt"),
+            f"/app/evaluation_function/{shaft_model_rel}",
+            "/app/evaluation_function/shaft_model.pt",
+        ],
+    }
+
+
+def _pick_existing_path(cands: List[str]) -> Optional[str]:
+    for p in cands:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
     Platform entry:
       response = [{"url": "...", ...}, ...]
-    Output:
-      - Plain text feedback (multi-line, capped)
-      - Optional: uploads det/label images (returns URLs as plain text lines)
     """
     t0 = time.perf_counter()
 
-    # If pipeline failed to import, return minimal error (short, non-HTML)
-    if run_yolo_pipeline is None:
-        err = PIPELINE_IMPORT_ERROR or {}
-        msg = f"E_PIPELINE_IMPORT: {err.get('exc_type', 'ImportError')}: {err.get('message', 'pipeline import failed')}"
-        return _result_minimal(False, msg)
+    # ----------------------------
+    # Diagnostics switches (mainly for frontend testing)
+    # ----------------------------
+    diag = str(_pget(params, "diag", "") or "").strip().lower()
 
-    # Validate input
+    # If diag_unbounded=True, allow long outputs (for UI freeze repro / stress)
+    diag_unbounded = bool(_pget(params, "diag_unbounded", False))
+    diag_chars = int(_pget(params, "diag_chars", 200_000))
+    diag_lines = int(_pget(params, "diag_lines", 5000))
+
+    max_chars = diag_chars if diag_unbounded else _MAX_FEEDBACK_CHARS
+    max_lines = diag_lines if diag_unbounded else _MAX_LINES
+
+    # Controls
+    return_images: bool = bool(_pget(params, "return_images", True))
+    gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
+    shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
+
+    # ----------------------------
+    # Input validation (needed by infer_once + normal pipeline)
+    # ----------------------------
     if not isinstance(response, list) or len(response) == 0:
-        return _result_minimal(False, "BAD_INPUT: Please upload at least one image.")
+        return _result_minimal(False, "BAD_INPUT: Please upload at least one image.", max_chars=max_chars)
 
     first = response[0] if isinstance(response[0], dict) else None
     url = first.get("url") if isinstance(first, dict) else None
     if not url:
-        return _result_minimal(False, "LOAD_FAIL: first image has no url field")
+        return _result_minimal(False, "LOAD_FAIL: first image has no url field", max_chars=max_chars)
 
-    # Controls (keep minimal; no debug spam)
-    return_images: bool = bool(_pget(params, "return_images", True))  # you want detection image
-    gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
-    shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
-
-    # Load image
+    # Load image (we do it early because infer_once needs it)
     img_bgr, err = _load_bgr_image_from_url(str(url))
     if img_bgr is None:
-        return _result_minimal(False, f"LOAD_FAIL: Failed to load image ({err})")
+        return _result_minimal(False, f"LOAD_FAIL: Failed to load image ({err})", max_chars=max_chars)
 
-    # Run pipeline (single image)
+    # ----------------------------
+    # DIAG 1) load_model_only  (matches your old smoke test name)
+    # ----------------------------
+    if diag == "load_model_only":
+        lines: List[str] = []
+        try:
+            model_to_load = str(_pget(params, "model_to_load", "gear") or "gear").strip().lower()
+            if model_to_load not in ("gear", "shaft"):
+                model_to_load = "gear"
+
+            lines.append("---- DIAG load_model_only ----")
+            lines.append(f"model_to_load: {model_to_load}")
+
+            # Import inside diagnostic (so normal path stays lighter)
+            t_imp0 = time.perf_counter()
+            from ultralytics import YOLO  # type: ignore
+            t_imp = time.perf_counter() - t_imp0
+            lines.append(f"t_import_ultralytics_s: {t_imp:.4f}")
+
+            # pick model file
+            cands = _candidate_model_paths(gear_model_rel, shaft_model_rel)[model_to_load]
+            model_path = _pick_existing_path(cands)
+            if not model_path:
+                lines.append("E_MODEL_NOT_FOUND: no model file found in candidates")
+                lines.append("candidates:")
+                lines.extend([f"  - {p}" for p in cands])
+                lines = _truncate_lines(lines, max_lines=max_lines)
+                return _result_minimal(False, "\n".join(lines), max_chars=max_chars)
+
+            lines.append(f"model_path: {model_path}")
+            try:
+                lines.append(f"model_size_bytes: {os.path.getsize(model_path)}")
+            except Exception:
+                pass
+
+            # Load model (this is the “hangy” part you want to reproduce)
+            t_load0 = time.perf_counter()
+            _ = YOLO(model_path)
+            t_load = time.perf_counter() - t_load0
+            lines.append(f"t_model_load_s: {t_load:.4f}")
+            lines.append("status: model loaded ✅")
+
+            dt = time.perf_counter() - t0
+            lines.append(f"runtime_s: {dt:.3f}")
+
+            lines = _truncate_lines(lines, max_lines=max_lines)
+            return _result_minimal(True, "\n".join(lines), max_chars=max_chars)
+
+        except Exception as e:
+            lines.append(f"E_DIAG_LOAD_MODEL_ONLY: {type(e).__name__}: {e}")
+            dt = time.perf_counter() - t0
+            lines.append(f"runtime_s: {dt:.3f}")
+            lines = _truncate_lines(lines, max_lines=max_lines)
+            return _result_minimal(False, "\n".join(lines), max_chars=max_chars)
+
+    # ----------------------------
+    # DIAG 2) infer_once (matches your old smoke test name)
+    # ----------------------------
+    if diag == "infer_once":
+        lines: List[str] = []
+        try:
+            model_to_load = str(_pget(params, "model_to_load", "gear") or "gear").strip().lower()
+            if model_to_load not in ("gear", "shaft"):
+                model_to_load = "gear"
+
+            imgsz = int(_pget(params, "imgsz", 640))
+            conf = float(_pget(params, "conf", 0.25))
+            device = str(_pget(params, "device", "cpu"))
+            verbose = bool(_pget(params, "verbose", False))
+
+            lines.append("---- DIAG infer_once ----")
+            lines.append(f"model_to_load: {model_to_load}")
+            lines.append(f"imgsz: {imgsz}")
+            lines.append(f"conf: {conf}")
+            lines.append(f"device: {device}")
+            lines.append(f"verbose: {verbose}")
+
+            t_imp0 = time.perf_counter()
+            from ultralytics import YOLO  # type: ignore
+            t_imp = time.perf_counter() - t_imp0
+            lines.append(f"t_import_ultralytics_s: {t_imp:.4f}")
+
+            cands = _candidate_model_paths(gear_model_rel, shaft_model_rel)[model_to_load]
+            model_path = _pick_existing_path(cands)
+            if not model_path:
+                lines.append("E_MODEL_NOT_FOUND: no model file found in candidates")
+                lines.append("candidates:")
+                lines.extend([f"  - {p}" for p in cands])
+                lines = _truncate_lines(lines, max_lines=max_lines)
+                return _result_minimal(False, "\n".join(lines), max_chars=max_chars)
+
+            lines.append(f"model_path: {model_path}")
+
+            t_load0 = time.perf_counter()
+            model = YOLO(model_path)
+            t_load = time.perf_counter() - t_load0
+            lines.append(f"t_model_load_s: {t_load:.4f}")
+
+            # Predict once (this can also hang / be slow)
+            t_pred0 = time.perf_counter()
+            _ = model.predict(
+                source=img_bgr,
+                imgsz=imgsz,
+                conf=conf,
+                device=device,
+                verbose=verbose,
+            )
+            t_pred = time.perf_counter() - t_pred0
+            lines.append(f"t_predict_s: {t_pred:.4f}")
+            lines.append("status: predict done ✅")
+
+            dt = time.perf_counter() - t0
+            lines.append(f"runtime_s: {dt:.3f}")
+
+            lines = _truncate_lines(lines, max_lines=max_lines)
+            return _result_minimal(True, "\n".join(lines), max_chars=max_chars)
+
+        except Exception as e:
+            lines.append(f"E_DIAG_INFER_ONCE: {type(e).__name__}: {e}")
+            dt = time.perf_counter() - t0
+            lines.append(f"runtime_s: {dt:.3f}")
+            lines = _truncate_lines(lines, max_lines=max_lines)
+            return _result_minimal(False, "\n".join(lines), max_chars=max_chars)
+
+    # ----------------------------
+    # Normal path: your YOLO pipeline
+    # ----------------------------
+    if run_yolo_pipeline is None:
+        erri = PIPELINE_IMPORT_ERROR or {}
+        msg = f"E_PIPELINE_IMPORT: {erri.get('exc_type', 'ImportError')}: {erri.get('message', 'pipeline import failed')}"
+        return _result_minimal(False, msg, max_chars=max_chars)
+
     try:
         out: Dict[str, Any] = run_yolo_pipeline(  # type: ignore[misc]
             img_bgr=img_bgr,
@@ -301,20 +455,15 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             return_images=return_images,
         )
     except Exception as e:
-        # minimal, no traceback to UI
-        return _result_minimal(False, f"E_PIPELINE_RUNTIME: {type(e).__name__}: {e}")
+        return _result_minimal(False, f"E_PIPELINE_RUNTIME: {type(e).__name__}: {e}", max_chars=max_chars)
 
-    # Build HUD-like feedback lines
     lines = _build_hud_from_pipeline_output(out)
 
-    # Optional: attach uploaded image links as plain text lines (no HTML)
     if return_images:
         imgs = out.get("images") if isinstance(out.get("images"), dict) else {}
-        # expected keys like "det_img", "label_img"
         det_img = imgs.get("det_img") if isinstance(imgs.get("det_img"), np.ndarray) else None
         label_img = imgs.get("label_img") if isinstance(imgs.get("label_img"), np.ndarray) else None
 
-        # Only if upload_image is available
         if upload_image is not None:
             try:
                 if det_img is not None:
@@ -326,25 +475,18 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
                     lab_url = upload_image(png, "eduvision")  # type: ignore[misc]
                     lines.append(f"label_img_url: {lab_url}")
             except ImageUploadError as e:
-                # keep short
                 lines.append(f"E_UPLOAD_FAIL: {e}")
             except Exception as e:
                 lines.append(f"E_UPLOAD_FAIL: {type(e).__name__}: {e}")
-        else:
-            # If upload isn't available, still OK — don't spam
-            pass
 
-    # Add a tiny runtime line (1 line only)
     dt = time.perf_counter() - t0
     lines.append(f"runtime_s: {dt:.3f}")
 
-    # Cap output
-    lines = _truncate_lines(lines)
+    lines = _truncate_lines(lines, max_lines=_MAX_LINES)
     msg = "\n".join(lines)
 
-    # Decide correctness: any E_* in errors => incorrect
     errors = out.get("errors") if isinstance(out.get("errors"), list) else []
     has_E = any(isinstance(e, dict) and str(e.get("code", "")).startswith("E_") for e in errors)
     is_correct = not has_E
 
-    return _result_minimal(is_correct, msg)
+    return _result_minimal(is_correct, msg, max_chars=_MAX_FEEDBACK_CHARS)
