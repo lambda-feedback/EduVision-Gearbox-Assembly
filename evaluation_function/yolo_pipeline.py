@@ -1,17 +1,27 @@
-# -*- coding: utf-8 -*-
 """
-YOLO inference pipeline (gear model + shaft OBB model)
-- Relative model paths (gear_model.pt, shaft_model.pt in the same folder)
-- Cached model loading (per process)
-- No folder scanning / no CSV writing (Lambda-friendly)
-- Keeps your core logic: object building, shaft assignment, stage chain naming,
-  assembly error checks, and gear-ratio computation.
+YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
 
-Minimal-intrusive optimisations added:
-1) Lazy-load ultralytics/torch to reduce Lambda cold-start import time.
+Design goal (as requested):
+- Always run a shared "base detection pass" for every task:
+    1) load gear+shaft models (cached per-process)
+    2) run gear detection
+    3) run shaft OBB detection
+    4) build objects (gears/spacers/mesh/mismesh)
+    5) pick gear11
+    6) assign gears/spacers to shafts (gear_to_si / spacer_to_si)
+- Then run ONLY the task-specific rules/checks and filter outputs for step-wise UI.
+
+Tasks:
+- task="shaft"          -> uses gear11-distance rule to define shaft2/shaft3, checks shaft2 class mismatch
+- task="spacer"         -> runs assembly checks but filters to spacer errors (E_SPACER*)
+- task="gear_inventory" -> counts gears (+ big/small stats) and optional expected mismatch
+- task="mesh_ratio"     -> full pipeline (assembly checks + chain naming + ratio)
+- task="full"           -> same as mesh_ratio (legacy full behavior)
+
+Minimal-intrusive optimisations:
+1) Lazy-load ultralytics to reduce Lambda cold-start import time.
 2) Timing instrumentation (model load + inference + total time).
-3) Cold-start flag (per-process) to help debugging on Lambda.
-4) Optional debug metadata in output.
+3) Cold-start flag (per-process).
 
 NOTE:
 - This file assumes lazy_load.py is located at: evaluation_function/lazy_load.py
@@ -31,13 +41,9 @@ import numpy as np
 # =========================
 # Lazy import hooks
 # =========================
-# Relative import (recommended inside evaluation_function package)
 from .lazy_load import LazyModule
 
-# Do NOT import ultralytics/torch at module import time (Lambda cold start)
 _ultralytics = LazyModule("ultralytics")
-
-# Cold-start flag (per-process). First invocation in this container => cold start.
 _COLD_START_FLAG = True
 
 if TYPE_CHECKING:
@@ -115,6 +121,16 @@ HUD_X: int = 20
 HUD_Y0: int = 40
 HUD_COLOR = (0, 255, 255)
 
+# -------------------------
+# Task constants
+# -------------------------
+TASK_SHAFT = "shaft"
+TASK_SPACER = "spacer"
+TASK_GEAR_INV = "gear_inventory"
+TASK_MESH_RATIO = "mesh_ratio"
+TASK_FULL = "full"
+_VALID_TASKS = {TASK_SHAFT, TASK_SPACER, TASK_GEAR_INV, TASK_MESH_RATIO, TASK_FULL}
+
 
 # =========================
 # Paths (relative)
@@ -140,7 +156,6 @@ def _load_yolo_model(abs_path: str) -> Any:
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Model not found: {abs_path}")
 
-    # Trigger lazy import here (not at module import time)
     YOLO_cls = _ultralytics.YOLO
     return YOLO_cls(abs_path)
 
@@ -730,7 +745,6 @@ def pick_driving_gear(gears: List[Dict[str, Any]]) -> Dict[str, Any]:
     cands = [g for g in gears if g["cls"] in DRIVING_GEAR_CLASS_NAMES]
     if cands:
         return max(cands, key=lambda x: x["score"])
-    # fallback: smallest radius
     return min(gears, key=lambda x: x["r"])
 
 
@@ -796,7 +810,7 @@ def is_big(gear: Dict[str, Any], median_r: float) -> bool:
 
 
 # =========================
-# Contact-box scoring
+# Contact-box scoring + chain naming (unchanged)
 # =========================
 def score_pair_by_contact_box(
     gA: Dict[str, Any],
@@ -896,9 +910,6 @@ def pick_compound_on_same_shaft(
     return candidates[0][1]
 
 
-# =========================
-# Force stage1 mate by short spacer (for chain)
-# =========================
 def find_stage2_shaft_index_by_short_spacer(
     spacers: List[Dict[str, Any]],
     spacer_to_si: Dict[int, int],
@@ -1068,6 +1079,44 @@ def stage_role_naming_chain(
 
 
 # =========================
+# Task-result helpers (packaging only)
+# =========================
+def _has_E(errors: List[Dict[str, Any]]) -> bool:
+    return any(isinstance(e, dict) and str(e.get("code", "")).startswith("E_") for e in errors)
+
+
+def _task_result(task: str, errors: List[Dict[str, Any]], focus: List[str], next_task: str, extra: Optional[List[str]] = None) -> Dict[str, Any]:
+    fail = _has_E(errors)
+    msgs: List[str] = []
+    if extra:
+        msgs.extend(extra)
+    for e in errors[:6]:
+        if isinstance(e, dict):
+            m = str(e.get("message", "")).strip()
+            c = str(e.get("code", "")).strip()
+            msgs.append(m if m else c)
+    return {
+        "task": task,
+        "status": "FAIL" if fail else "PASS",
+        "is_ready_for_next": (not fail),
+        "focus": focus,
+        "messages": msgs,
+        "recommended_next_task": next_task,
+    }
+
+
+def _filter_errors_by_prefix(errors: List[Dict[str, str]], prefixes: Tuple[str, ...]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for e in errors:
+        if not isinstance(e, dict):
+            continue
+        code = str(e.get("code", "")).upper()
+        if any(code.startswith(p.upper()) for p in prefixes):
+            out.append(e)
+    return out
+
+
+# =========================
 # Public API
 # =========================
 def run_yolo_pipeline(
@@ -1075,12 +1124,28 @@ def run_yolo_pipeline(
     gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
     shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
     return_images: bool = False,
+    *,
+    task: str = TASK_FULL,
+    expected_gears: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Main pipeline entry.
+    Always-base-detect pipeline:
+    - Always runs gear+shaft detections and builds core objects/assignments.
+    - Then applies task-specific rules and filters outputs.
+
+    task:
+      - "shaft"
+      - "spacer"
+      - "gear_inventory"
+      - "mesh_ratio"
+      - "full"
     """
     if img_bgr is None or not hasattr(img_bgr, "shape"):
         raise ValueError("img_bgr must be a valid OpenCV image (BGR).")
+
+    task = str(task or TASK_FULL).strip().lower()
+    if task not in _VALID_TASKS:
+        task = TASK_FULL
 
     global _COLD_START_FLAG
     is_cold_start = _COLD_START_FLAG
@@ -1089,6 +1154,9 @@ def run_yolo_pipeline(
     t0_total = time.perf_counter()
     timing: Dict[str, float] = {}
 
+    # -------------------------------------------------
+    # A) ALWAYS: load both models + run both detections
+    # -------------------------------------------------
     gear_model, shaft_model = get_models(gear_model_rel, shaft_model_rel, timing=timing)
 
     t_g0 = time.perf_counter()
@@ -1102,6 +1170,285 @@ def run_yolo_pipeline(
     gears, spacers, mesh_boxes, mismesh_boxes = build_objects(gear_dets)
     contact_boxes = list(mesh_boxes) + list(mismesh_boxes)
 
+    # gear11 + assignments (only if possible)
+    gear11_gid: Optional[int] = None
+    gear_to_si: Dict[int, int] = {}
+    spacer_to_si: Dict[int, int] = {}
+
+    if gears:
+        driving = pick_driving_gear(gears)
+        gear11_gid = int(driving["gid"])
+
+    if gears and shaft_obbs:
+        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
+
+    # -------------------------------------------------
+    # B) TASK-SPECIFIC RULES / FILTERING
+    # -------------------------------------------------
+    errors_all: List[Dict[str, str]] = []
+
+    # prerequisites (for tasks that need them)
+    def _need_gears() -> bool:
+        return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL, TASK_GEAR_INV)
+
+    def _need_shafts() -> bool:
+        return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL)
+
+    # Always attach these if missing and needed
+    if _need_gears() and not gears:
+        errors_all.append({"code": "E_NO_GEARS", "message": "No gears detected."})
+    if _need_shafts() and not shaft_obbs:
+        errors_all.append({"code": "E_NO_SHAFTS", "message": "No shafts detected."})
+
+    # --- task: gear_inventory ---
+    if task == TASK_GEAR_INV:
+        # big/small stats
+        big_cnt = 0
+        small_cnt = 0
+        if gears:
+            med = compute_median_radius(gears)
+            for g in gears:
+                if is_big(g, med):
+                    big_cnt += 1
+                else:
+                    small_cnt += 1
+
+        if expected_gears is not None and gears:
+            try:
+                exp = int(expected_gears)
+                if len(gears) != exp:
+                    errors_all.append({"code": "E_GEAR_COUNT_MISMATCH", "message": f"Gear inventory: detected {len(gears)}, expected {exp}."})
+            except Exception:
+                pass
+
+        errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_GEAR_COUNT", "E_GEAR"))
+        out: Dict[str, Any] = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": 0,
+                "gear_big": big_cnt,
+                "gear_small": small_cnt,
+            },
+            "errors": errors,
+            "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_GEAR_INV,
+                errors,
+                focus=["gears"],
+                next_task=TASK_MESH_RATIO,
+                extra=["Step D: Gear presence & type (inventory)."],
+            ),
+        }
+
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
+
+        if return_images:
+            det_img = img_bgr.copy()
+            label_img = img_bgr.copy()
+
+            # draw gears + spacers + mesh boxes (inventory)
+            for b in mesh_boxes:
+                draw_bbox(det_img, b, (255, 255, 0), 2)
+                put_text_outline(det_img, "Mesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 255, 0))
+            for b in mismesh_boxes:
+                draw_bbox(det_img, b, (255, 0, 255), 2)
+                put_text_outline(det_img, "Mismesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 0, 255))
+
+            for sp in spacers:
+                draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
+                put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
+                cv2.circle(det_img, (int(sp["center"][0]), int(sp["center"][1])), CENTER_R, (0, 255, 255), -1)
+
+            for g in gears:
+                draw_bbox(det_img, g["bbox"], (0, 255, 0), 2)
+                cx, cy = int(g["center"][0]), int(g["center"][1])
+                cv2.circle(det_img, (cx, cy), CENTER_R, (0, 0, 255), -1)
+                put_text_outline(det_img, f"{g['cls']} {g['score']:.2f}", (g["bbox"][0] + 3, g["bbox"][1] - 6), 0.55, 2, (0, 255, 0))
+
+            hud = [
+                f"Gears: {len(gears)} (big={big_cnt}, small={small_cnt})",
+                f"Spacers: {len(spacers)}  Shafts: {len(shaft_obbs)}",
+            ]
+            if errors:
+                hud.append("---- ISSUES ----")
+                hud += [e["message"] for e in errors[:6]]
+            else:
+                hud.append("Issues: None")
+
+            draw_hud_lines(det_img, hud)
+            draw_hud_lines(label_img, hud)
+            out["images"] = {"det_img": det_img, "label_img": label_img}
+
+        return out
+
+    # --- task: shaft ---
+    if task == TASK_SHAFT:
+        # if prerequisites failed, just return those
+        if errors_all:
+            errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
+        else:
+            # gear11-distance shaft2/shaft3 and rule on shaft2 class
+            errors_all_local: List[Dict[str, str]] = []
+
+            if gear11_gid is None:
+                errors_all_local.append({"code": "E_NO_GEAR11", "message": "Cannot determine gear11 (driving gear) from detections."})
+            else:
+                _shaft1, shaft2, _shaft3 = pick_shaft2_and_shaft3_by_distance(
+                    shafts=shaft_obbs,
+                    gear11_gid=gear11_gid,
+                    gear_to_si=gear_to_si,
+                    gears=gears,
+                )
+                if shaft2 is None:
+                    errors_all_local.append({"code": "E_SHAFT2_NOT_FOUND", "message": "Cannot determine shaft2 (closest shaft to gear11)."})
+                else:
+                    if str(shaft_obbs[shaft2]["cls"]) == "shaft_long":
+                        errors_all_local.append({
+                            "code": "E_SHAFT2_CLASS_MISMATCH",
+                            "message": "Shaft check: shaft2 (closest shaft to gear11) is classified as 'shaft_long' (expected 'shaft_short')."
+                        })
+
+            errors = _filter_errors_by_prefix(errors_all_local, prefixes=("E_SHAFT", "E_NO_GEAR11"))
+
+        out = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": 0,
+            },
+            "errors": errors,
+            "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_SHAFT,
+                errors,
+                focus=["shafts"],
+                next_task=TASK_SPACER,
+                extra=["Step B: Shaft correctness (uses gear11-distance to define shaft2)."],
+            ),
+        }
+
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
+
+        if return_images:
+            det_img = img_bgr.copy()
+            label_img = img_bgr.copy()
+
+            # draw shafts only (for clarity)
+            for s in shaft_obbs:
+                poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
+                put_text_outline(det_img, f"{s['cls']} {s['score']:.2f}", (s["center"][0] + 6, s["center"][1] + 6), 0.55, 2, (255, 255, 255))
+
+            # optionally mark gear11 center (small dot) without showing all gears
+            if gear11_gid is not None:
+                g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
+                if g11 is not None:
+                    cx, cy = int(g11["center"][0]), int(g11["center"][1])
+                    cv2.circle(det_img, (cx, cy), CENTER_R + 2, (0, 0, 255), -1)
+                    put_text_outline(det_img, "gear11(ref)", (cx + 10, cy - 10), 0.6, 2, (0, 0, 255))
+
+            hud = [f"Shafts: {len(shaft_obbs)}  Gears: {len(gears)}"]
+            if errors:
+                hud.append("---- ISSUES ----")
+                hud += [e["message"] for e in errors[:6]]
+            else:
+                hud.append("Issues: None")
+
+            draw_hud_lines(det_img, hud)
+            draw_hud_lines(label_img, hud)
+            out["images"] = {"det_img": det_img, "label_img": label_img}
+
+        return out
+
+    # --- task: spacer ---
+    if task == TASK_SPACER:
+        if errors_all:
+            errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
+        else:
+            # reuse existing assembly checks; filter to spacer errors
+            errors_all_local = []
+            if ENABLE_ERROR_CHECKS and gear11_gid is not None:
+                errors_all_local = evaluate_assembly_errors(
+                    gears=gears,
+                    spacers=spacers,
+                    shafts=shaft_obbs,
+                    mesh_boxes=mesh_boxes,
+                    mismesh_boxes=mismesh_boxes,
+                    gear11_gid=gear11_gid,
+                    gear_to_si=gear_to_si,
+                    spacer_to_si=spacer_to_si,
+                )
+            errors = _filter_errors_by_prefix(errors_all_local, prefixes=("E_SPACER",))
+
+        out = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": 0,
+            },
+            "errors": errors,
+            "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_SPACER,
+                errors,
+                focus=["spacers"],
+                next_task=TASK_GEAR_INV,
+                extra=["Step C: Spacer correctness (presence/type/order)."],
+            ),
+        }
+
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
+
+        if return_images:
+            det_img = img_bgr.copy()
+            label_img = img_bgr.copy()
+
+            # draw shafts + spacers for this step
+            for s in shaft_obbs:
+                poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
+
+            for sp in spacers:
+                draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
+                put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
+                cv2.circle(det_img, (int(sp["center"][0]), int(sp["center"][1])), CENTER_R, (0, 255, 255), -1)
+
+            hud = [f"Shafts: {len(shaft_obbs)}  Spacers: {len(spacers)}"]
+            if errors:
+                hud.append("---- ISSUES ----")
+                hud += [e["message"] for e in errors[:6]]
+            else:
+                hud.append("Issues: None")
+
+            draw_hud_lines(det_img, hud)
+            draw_hud_lines(label_img, hud)
+            out["images"] = {"det_img": det_img, "label_img": label_img}
+
+        return out
+
+    # -------------------------------------------------
+    # task=mesh_ratio OR task=full -> FULL logic
+    # -------------------------------------------------
+    # If missing gears, return early (consistent with previous behavior)
     if not gears:
         out = {
             "summary": {
@@ -1122,24 +1469,34 @@ def run_yolo_pipeline(
         timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
         out["timing"] = timing
         out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
+        out["task_result"] = _task_result(
+            TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
+            out["errors"],
+            focus=["mesh_ratio"],
+            next_task=TASK_SHAFT,
+            extra=["Step E: Mesh & ratio requires gears."],
+        )
         if return_images:
             out["images"] = {"det_img": img_bgr.copy(), "label_img": img_bgr.copy()}
         return out
 
-    driving = pick_driving_gear(gears)
-    gear11_gid = driving["gid"]
+    # Full path
+    if gear11_gid is None:
+        gear11_gid = pick_driving_gear(gears)["gid"]
 
-    gear_to_si, si_to_gids, spacer_to_si, si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
+    # Ensure assignments exist (if shafts exist)
+    if gears and shaft_obbs and not gear_to_si:
+        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
 
     errors: List[Dict[str, str]] = []
-    if ENABLE_ERROR_CHECKS:
+    if ENABLE_ERROR_CHECKS and shaft_obbs:
         errors = evaluate_assembly_errors(
             gears=gears,
             spacers=spacers,
             shafts=shaft_obbs,
             mesh_boxes=mesh_boxes,
             mismesh_boxes=mismesh_boxes,
-            gear11_gid=gear11_gid,
+            gear11_gid=int(gear11_gid),
             gear_to_si=gear_to_si,
             spacer_to_si=spacer_to_si,
         )
@@ -1150,7 +1507,7 @@ def run_yolo_pipeline(
         contact_boxes=contact_boxes,
         gear_to_si=gear_to_si,
         spacer_to_si=spacer_to_si,
-        gear11_gid=gear11_gid,
+        gear11_gid=int(gear11_gid),
     )
 
     num_stages, R_total, out_rpm, per_stage = compute_ratio_and_rpm_from_stage_labels(
@@ -1160,7 +1517,7 @@ def run_yolo_pipeline(
         max_stage=MAX_STAGE,
     )
 
-    out: Dict[str, Any] = {
+    out = {
         "summary": {
             "gears": len(gears),
             "spacers": len(spacers),
@@ -1195,23 +1552,31 @@ def run_yolo_pipeline(
         "cold_start": bool(is_cold_start),
     }
 
+    out["task_result"] = _task_result(
+        TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
+        errors,
+        focus=["mesh_ratio"],
+        next_task=TASK_FULL,
+        extra=["Step E: Meshing & ratio (functional performance)."],
+    )
+
     # ---- timings/debug ----
     timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
     out["timing"] = timing
     out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
 
-    # ---- images (unchanged core drawing logic) ----
+    # ---- images (full drawing) ----
     if return_images:
         det_img = img_bgr.copy()
         label_img = img_bgr.copy()
 
-        # draw shafts (poly)
+        # shafts
         for s in shaft_obbs:
             poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
             put_text_outline(det_img, f"{s['cls']} {s['score']:.2f}", (s["center"][0] + 6, s["center"][1] + 6), 0.55, 2, (255, 255, 255))
 
-        # mesh / mismesh boxes
+        # mesh / mismesh
         for b in mesh_boxes:
             draw_bbox(det_img, b, (255, 255, 0), 2)
             put_text_outline(det_img, "Mesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 255, 0))
