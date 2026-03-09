@@ -14,7 +14,6 @@ def _as_file_uri(path: str) -> str:
 def _feedback_as_text(feedback):
     """Normalize feedback to plain text for assertions."""
     if isinstance(feedback, list):
-        # list of tuples or list of strings -> flatten
         parts = []
         for item in feedback:
             if isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -34,7 +33,7 @@ class TestEvaluationFunction(unittest.TestCase):
     - test_evaluation_missing_image:
         Empty response should not crash, should return a valid Result dict.
     - test_evaluation_bad_url:
-        Invalid URL should not crash, should return a valid Result dict with error-like feedback.
+        Invalid URL should not crash, should return a valid Result dict with final user-facing feedback.
     """
 
     def test_evaluation_with_local_file_url(self):
@@ -56,7 +55,7 @@ class TestEvaluationFunction(unittest.TestCase):
         }]
 
         answer = {}
-        params = Params(return_images=False, debug=True, show_target=False)
+        params = Params(return_images=False, show_target=False)
 
         result = evaluation_function(response, answer, params).to_dict()
 
@@ -68,13 +67,15 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertTrue(isinstance(fb, (list, str)))
 
         fb_text = _feedback_as_text(fb)
-        # For a valid image, it should NOT be a load fail message
-        self.assertNotIn("LOAD_FAIL", fb_text)
+
+        # For a valid image, it should not be a load/read failure message.
+        self.assertNotIn("could not be loaded", fb_text.lower())
+        self.assertNotIn("please upload at least one image", fb_text.lower())
 
     def test_evaluation_missing_image(self):
         response = []
         answer = {}
-        params = Params(return_images=False, debug=True)
+        params = Params(return_images=False)
 
         result = evaluation_function(response, answer, params).to_dict()
 
@@ -82,6 +83,12 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertIn("is_correct", result)
         self.assertIn("feedback", result)
         self.assertFalse(result["is_correct"])
+
+        fb = result["feedback"]
+        self.assertTrue(isinstance(fb, (list, str)))
+
+        fb_text = _feedback_as_text(fb)
+        self.assertIn("please upload at least one image", fb_text.lower())
 
     def test_evaluation_bad_url(self):
         response = [{
@@ -91,20 +98,20 @@ class TestEvaluationFunction(unittest.TestCase):
             "url": "file:///THIS/PATH/DOES/NOT/EXIST.jpg",
         }]
         answer = {}
-        params = Params(return_images=False, debug=True)
+        params = Params(return_images=False)
 
         result = evaluation_function(response, answer, params).to_dict()
 
         self.assertIsInstance(result, dict)
         self.assertIn("is_correct", result)
         self.assertIn("feedback", result)
+        self.assertFalse(result["is_correct"])
 
         fb = result["feedback"]
         self.assertTrue(isinstance(fb, (list, str)))
 
         fb_text = _feedback_as_text(fb)
-        # Here we EXPECT an error-like message
-        self.assertIn("LOAD_FAIL", fb_text)
+        self.assertIn("could not be loaded", fb_text.lower())
 
 
 if __name__ == "__main__":
