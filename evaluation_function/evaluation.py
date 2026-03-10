@@ -1,3 +1,4 @@
+#Update precheck to use gear-contact count consistency 2
 from __future__ import annotations
 
 import os
