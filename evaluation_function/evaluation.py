@@ -25,8 +25,6 @@ except Exception:
 # Output caps
 # ----------------------------
 _MAX_FEEDBACK_CHARS = int(os.environ.get("LF_MAX_FEEDBACK_CHARS", "1200"))
-
-# Stage target for experiment goal
 TARGET_STAGE_COUNT = int(os.environ.get("LF_TARGET_STAGE_COUNT", "6"))
 
 
@@ -40,6 +38,15 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     "precheck": {
         "pass": "Good photo. You can proceed.",
         "fail": "Please retake the photo. The image is not suitable for reliable checking.",
+    },
+    "single_stage": {
+        "pass": (
+            "Good. A valid single-stage setup was detected.\n"
+            "Detected stages: {num_stages}\n"
+            "Gear ratio: {R_total}\n"
+            "Output speed: {out_rpm} RPM"
+        ),
+        "fail": "Please check the single-stage setup again. A valid one-stage transmission could not be confirmed.",
     },
     "shaft": {
         "pass": "Good. The shaft setup looks correct.",
@@ -171,6 +178,9 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
                 "E_PRECHECK_COUNT_RULE_FAIL",
             }
 
+        if task == "single_stage":
+            return code.startswith("E_SINGLE_STAGE") or code == "E_NO_GEARS"
+
         if task == "shaft":
             return code.startswith("E_SHAFT") or code == "E_NO_SHAFTS" or code == "E_NO_GEAR11"
 
@@ -285,7 +295,7 @@ def _build_student_message(
     if task == "parts_inventory":
         return _build_parts_inventory_message(out, part_type)
 
-    if task not in ("precheck", "shaft", "spacer", "gear_inventory", "mesh_ratio"):
+    if task not in ("precheck", "single_stage", "shaft", "spacer", "gear_inventory", "mesh_ratio"):
         task = "mesh_ratio"
 
     if task == "precheck":
@@ -297,6 +307,25 @@ def _build_student_message(
         if has_fail:
             return False, MESSAGE_POLICY["precheck"]["fail"]
         return True, MESSAGE_POLICY["precheck"]["pass"]
+
+    if task == "single_stage":
+        is_correct = not _has_pipeline_error(errors)
+        if not is_correct:
+            return False, MESSAGE_POLICY["single_stage"]["fail"]
+
+        ratio = out.get("ratio") if isinstance(out.get("ratio"), dict) else {}
+        num_stages = ratio.get("num_stages")
+        r_total = ratio.get("R_total")
+        out_rpm = ratio.get("out_rpm")
+
+        if num_stages is None or r_total is None or out_rpm is None:
+            return False, MESSAGE_POLICY["single_stage"]["fail"]
+
+        return True, MESSAGE_POLICY["single_stage"]["pass"].format(
+            num_stages=_format_stage_value(num_stages),
+            R_total=_format_ratio_value(r_total),
+            out_rpm=_format_rpm_value(out_rpm),
+        )
 
     is_correct = not _has_pipeline_error(errors)
 
@@ -417,8 +446,7 @@ def _build_student_message(
         )
         return True, msg
 
-    key = "pass" if is_correct else "fail"
-    return is_correct, MESSAGE_POLICY[task][key]
+    return False, "Unsupported task."
 
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
@@ -432,7 +460,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         pipeline_task = task
         message_task = task
 
-    return_images: bool = bool(_pget(params, "return_images", pipeline_task != "precheck"))
+    return_images: bool = bool(_pget(params, "return_images", pipeline_task not in ("precheck", "parts_inventory", "single_stage")))
     gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
     shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
     expected_gears = _pget(params, "expected_gears", None)
@@ -460,7 +488,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             img_bgr=img_bgr,
             gear_model_rel=gear_model_rel,
             shaft_model_rel=shaft_model_rel,
-            return_images=(return_images and pipeline_task != "precheck"),
+            return_images=return_images,
             task=pipeline_task,
             part_type=part_type,
             expected_gears=expected_gears,
@@ -470,7 +498,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             img_bgr=img_bgr,
             gear_model_rel=gear_model_rel,
             shaft_model_rel=shaft_model_rel,
-            return_images=(return_images and pipeline_task != "precheck"),
+            return_images=return_images,
             task=pipeline_task,
             expected_gears=expected_gears,
         )

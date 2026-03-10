@@ -14,6 +14,13 @@ Final streamlined version:
 - Adds precheck logic:
     1) checks only the consistency rule between gear count and (mesh + mismesh) count
     2) does not separately decide whether gears or contacts are wrong
+- Adds single-stage logic:
+    1) expects 1 driving gear
+    2) expects 1 short spacer
+    3) expects 1 small gear and 1 big gear
+    4) expects 1 shaft (long or short)
+    5) expects no mismesh
+    6) expects exactly 1 stage and a valid ratio
 - Adds improved shaft-step logic:
     1) missing shaft / wrong shaft count
     2) two shafts of the same detected type
@@ -100,6 +107,7 @@ SPACER_DIST_TOL_PX: float = 5.0
 # -------------------------
 TASK_PARTS_INVENTORY = "parts_inventory"
 TASK_PRECHECK = "precheck"
+TASK_SINGLE_STAGE = "single_stage"
 TASK_SHAFT = "shaft"
 TASK_SPACER = "spacer"
 TASK_GEAR_INV = "gear_inventory"
@@ -109,6 +117,7 @@ TASK_FULL = "full"
 _VALID_TASKS = {
     TASK_PARTS_INVENTORY,
     TASK_PRECHECK,
+    TASK_SINGLE_STAGE,
     TASK_SHAFT,
     TASK_SPACER,
     TASK_GEAR_INV,
@@ -453,6 +462,76 @@ def evaluate_parts_inventory(
             "message": f"Unsupported part_type: {part_type}",
         }],
     }
+
+
+# =========================
+# Single-stage helpers
+# =========================
+def evaluate_single_stage_errors(
+    gears: List[Dict[str, Any]],
+    spacers: List[Dict[str, Any]],
+    shafts: List[Dict[str, Any]],
+    mismesh_boxes: List[Tuple[float, float, float, float]],
+    ratio: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    errs: List[Dict[str, str]] = []
+
+    driving_cnt = sum(1 for g in gears if str(g["cls"]) in DRIVING_GEAR_CLASS_NAMES)
+    big_cnt = sum(1 for g in gears if str(g["cls"]) == GEAR_BIG_NAME)
+    small_cnt = sum(1 for g in gears if str(g["cls"]) == GEAR_SMALL_NAME)
+    short_spacer_cnt = sum(1 for sp in spacers if spacer_is_short(sp))
+    shaft_cnt = len(shafts)
+
+    if driving_cnt != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_DRIVING_GEAR",
+            "message": f"Expected 1 driving gear, but detected {driving_cnt}.",
+        })
+
+    if short_spacer_cnt != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_SHORT_SPACER",
+            "message": f"Expected 1 short spacer, but detected {short_spacer_cnt}.",
+        })
+
+    if small_cnt != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_SMALL_GEAR",
+            "message": f"Expected 1 small gear, but detected {small_cnt}.",
+        })
+
+    if big_cnt != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_BIG_GEAR",
+            "message": f"Expected 1 big gear, but detected {big_cnt}.",
+        })
+
+    if shaft_cnt != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_SHAFT",
+            "message": f"Expected 1 shaft, but detected {shaft_cnt}.",
+        })
+
+    if len(mismesh_boxes) > 0:
+        errs.append({
+            "code": "E_SINGLE_STAGE_MISMESH",
+            "message": f"Mismesh detected (count={len(mismesh_boxes)}).",
+        })
+
+    num_stages = ratio.get("num_stages")
+    if num_stages != 1:
+        errs.append({
+            "code": "E_SINGLE_STAGE_STAGE_COUNT",
+            "message": f"Expected 1 stage, but detected {num_stages}.",
+        })
+
+    if ratio.get("R_total") is None or ratio.get("out_rpm") is None:
+        errs.append({
+            "code": "E_SINGLE_STAGE_RATIO",
+            "message": "The single-stage gear ratio could not be calculated reliably.",
+        })
+
+    return errs
 
 
 # =========================
@@ -1370,6 +1449,7 @@ def run_yolo_pipeline(
         return task in (
             TASK_PARTS_INVENTORY,
             TASK_PRECHECK,
+            TASK_SINGLE_STAGE,
             TASK_SHAFT,
             TASK_SPACER,
             TASK_MESH_RATIO,
@@ -1380,6 +1460,7 @@ def run_yolo_pipeline(
     def _need_shafts() -> bool:
         return task in (
             TASK_PARTS_INVENTORY,
+            TASK_SINGLE_STAGE,
             TASK_SHAFT,
             TASK_SPACER,
             TASK_MESH_RATIO,
@@ -1449,6 +1530,99 @@ def run_yolo_pipeline(
                 TASK_PRECHECK,
                 errors,
                 focus=["precheck"],
+                next_task=TASK_SINGLE_STAGE,
+            ),
+            "timing": {},
+        }
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        return out
+
+    # --- task: single_stage ---
+    if task == TASK_SINGLE_STAGE:
+        if not gears:
+            out = {
+                "summary": {
+                    "gears": 0,
+                    "spacers": len(spacers),
+                    "shafts": len(shaft_obbs),
+                    "mesh": len(mesh_boxes),
+                    "mismesh": len(mismesh_boxes),
+                    "stages": 0,
+                },
+                "errors": [{"code": "E_NO_GEARS", "message": "No gears detected."}],
+                "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+                "cold_start": bool(is_cold_start),
+                "task_result": _task_result(
+                    TASK_SINGLE_STAGE,
+                    [{"code": "E_NO_GEARS", "message": "No gears detected."}],
+                    focus=["single_stage"],
+                    next_task=TASK_SHAFT,
+                ),
+                "timing": {},
+            }
+            timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+            out["timing"] = timing
+            return out
+
+        if gear11_gid is None:
+            gear11_gid = pick_driving_gear(gears)["gid"]
+
+        if gears and shaft_obbs and not gear_to_si:
+            gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(
+                gears, spacers, shaft_obbs
+            )
+
+        gear_names, gear_stage, chain_pairs = stage_role_naming_chain(
+            gears=gears,
+            spacers=spacers,
+            contact_boxes=contact_boxes,
+            gear_to_si=gear_to_si,
+            spacer_to_si=spacer_to_si,
+            gear11_gid=int(gear11_gid),
+        )
+
+        num_stages, R_total, out_rpm, per_stage = compute_ratio_and_rpm_from_stage_labels(
+            gears=gears,
+            gear_names=gear_names,
+            motor_rpm=MOTOR_RPM,
+            max_stage=MAX_STAGE,
+        )
+
+        ratio = {
+            "num_stages": num_stages,
+            "R_total": R_total,
+            "out_rpm": out_rpm,
+            "per_stage": per_stage,
+        }
+
+        errors = evaluate_single_stage_errors(
+            gears=gears,
+            spacers=spacers,
+            shafts=shaft_obbs,
+            mismesh_boxes=mismesh_boxes,
+            ratio=ratio,
+        )
+
+        out = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": num_stages,
+            },
+            "gear_names": gear_names,
+            "gear_stage": gear_stage,
+            "chain_pairs": chain_pairs,
+            "ratio": ratio,
+            "errors": errors,
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_SINGLE_STAGE,
+                errors,
+                focus=["single_stage"],
                 next_task=TASK_SHAFT,
             ),
             "timing": {},
