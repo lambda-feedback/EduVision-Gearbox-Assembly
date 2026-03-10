@@ -4,6 +4,13 @@ YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
 Final streamlined version:
 - Keeps core detection and task logic
 - Removes overlay image generation and drawing utilities
+- Adds parts inventory logic:
+    1) supports part_type = gear / shaft / spacer
+    2) outputs counts only for:
+       - gear: biggear / smallgear
+       - shaft: shaft_long / shaft_short
+       - spacer: spacer_long / spacer_short
+    3) excludes white driving gear from parts inventory gear counts
 - Adds precheck logic:
     1) checks only the consistency rule between gear count and (mesh + mismesh) count
     2) does not separately decide whether gears or contacts are wrong
@@ -91,13 +98,23 @@ SPACER_DIST_TOL_PX: float = 5.0
 # -------------------------
 # Task constants
 # -------------------------
+TASK_PARTS_INVENTORY = "parts_inventory"
 TASK_PRECHECK = "precheck"
 TASK_SHAFT = "shaft"
 TASK_SPACER = "spacer"
 TASK_GEAR_INV = "gear_inventory"
 TASK_MESH_RATIO = "mesh_ratio"
 TASK_FULL = "full"
-_VALID_TASKS = {TASK_PRECHECK, TASK_SHAFT, TASK_SPACER, TASK_GEAR_INV, TASK_MESH_RATIO, TASK_FULL}
+
+_VALID_TASKS = {
+    TASK_PARTS_INVENTORY,
+    TASK_PRECHECK,
+    TASK_SHAFT,
+    TASK_SPACER,
+    TASK_GEAR_INV,
+    TASK_MESH_RATIO,
+    TASK_FULL,
+}
 
 
 # =========================
@@ -330,6 +347,112 @@ def evaluate_precheck_count_rule(
         })
 
     return errs
+
+
+# =========================
+# Parts inventory helpers
+# =========================
+def evaluate_parts_inventory(
+    *,
+    part_type: str,
+    gear_dets: List[Dict[str, Any]],
+    shaft_dets: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Returns counts only for the requested part type.
+
+    part_type:
+      - "gear"   -> biggear / smallgear
+      - "shaft"  -> shaft_long / shaft_short
+      - "spacer" -> spacer_long / spacer_short
+
+    Notes:
+      - white driving gear is excluded from gear counts
+      - color is ignored
+    """
+    errors: List[Dict[str, str]] = []
+    counts: Dict[str, int] = {}
+    part_type = str(part_type or "").strip().lower()
+
+    if part_type == "gear":
+        counts = {
+            "biggear": 0,
+            "smallgear": 0,
+        }
+
+        for d in gear_dets:
+            cls = str(d.get("cls", ""))
+            if cls == GEAR_BIG_NAME:
+                counts["biggear"] += 1
+            elif cls == GEAR_SMALL_NAME:
+                counts["smallgear"] += 1
+
+        if (counts["biggear"] + counts["smallgear"]) == 0:
+            errors.append({
+                "code": "E_NO_TARGET_PARTS",
+                "message": "No target gears were detected.",
+            })
+
+        return {
+            "counts": counts,
+            "errors": errors,
+        }
+
+    if part_type == "shaft":
+        counts = {
+            "shaft_long": 0,
+            "shaft_short": 0,
+        }
+
+        for d in shaft_dets:
+            cls = str(d.get("cls", ""))
+            if cls == "shaft_long":
+                counts["shaft_long"] += 1
+            elif cls == "shaft_short":
+                counts["shaft_short"] += 1
+
+        if (counts["shaft_long"] + counts["shaft_short"]) == 0:
+            errors.append({
+                "code": "E_NO_TARGET_PARTS",
+                "message": "No target shafts were detected.",
+            })
+
+        return {
+            "counts": counts,
+            "errors": errors,
+        }
+
+    if part_type == "spacer":
+        counts = {
+            "spacer_long": 0,
+            "spacer_short": 0,
+        }
+
+        for d in gear_dets:
+            cls = str(d.get("cls", "")).lower().replace(" ", "_")
+            if ("spacer" in cls) and ("long" in cls):
+                counts["spacer_long"] += 1
+            elif ("spacer" in cls) and ("short" in cls):
+                counts["spacer_short"] += 1
+
+        if (counts["spacer_long"] + counts["spacer_short"]) == 0:
+            errors.append({
+                "code": "E_NO_TARGET_PARTS",
+                "message": "No target spacers were detected.",
+            })
+
+        return {
+            "counts": counts,
+            "errors": errors,
+        }
+
+    return {
+        "counts": {},
+        "errors": [{
+            "code": "E_BAD_PART_TYPE",
+            "message": f"Unsupported part_type: {part_type}",
+        }],
+    }
 
 
 # =========================
@@ -1198,6 +1321,7 @@ def run_yolo_pipeline(
     return_images: bool = False,
     *,
     task: str = TASK_FULL,
+    part_type: Optional[str] = None,
     expected_gears: Optional[int] = None,
 ) -> Dict[str, Any]:
     if img_bgr is None or not hasattr(img_bgr, "shape"):
@@ -1206,6 +1330,8 @@ def run_yolo_pipeline(
     task = str(task or TASK_FULL).strip().lower()
     if task not in _VALID_TASKS:
         task = TASK_FULL
+
+    part_type = str(part_type or "").strip().lower()
 
     global _COLD_START_FLAG
     is_cold_start = _COLD_START_FLAG
@@ -1241,15 +1367,63 @@ def run_yolo_pipeline(
     errors_all: List[Dict[str, str]] = []
 
     def _need_gears() -> bool:
-        return task in (TASK_PRECHECK, TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL, TASK_GEAR_INV)
+        return task in (
+            TASK_PARTS_INVENTORY,
+            TASK_PRECHECK,
+            TASK_SHAFT,
+            TASK_SPACER,
+            TASK_MESH_RATIO,
+            TASK_FULL,
+            TASK_GEAR_INV,
+        )
 
     def _need_shafts() -> bool:
-        return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL)
+        return task in (
+            TASK_PARTS_INVENTORY,
+            TASK_SHAFT,
+            TASK_SPACER,
+            TASK_MESH_RATIO,
+            TASK_FULL,
+        )
 
     if _need_gears() and not gears:
         errors_all.append({"code": "E_NO_GEARS", "message": "No gears detected."})
     if _need_shafts() and not shaft_obbs:
         errors_all.append({"code": "E_NO_SHAFTS", "message": "No shafts detected."})
+
+    # --- task: parts_inventory ---
+    if task == TASK_PARTS_INVENTORY:
+        inv = evaluate_parts_inventory(
+            part_type=part_type,
+            gear_dets=gear_dets,
+            shaft_dets=shaft_obbs,
+        )
+
+        out: Dict[str, Any] = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": 0,
+                "part_type": part_type,
+            },
+            "counts": inv.get("counts", {}),
+            "errors": inv.get("errors", []),
+            "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_PARTS_INVENTORY,
+                inv.get("errors", []),
+                focus=[part_type or "parts_inventory"],
+                next_task=TASK_PRECHECK,
+            ),
+            "timing": {},
+        }
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        return out
 
     # --- task: precheck ---
     if task == TASK_PRECHECK:

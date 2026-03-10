@@ -1,4 +1,3 @@
-#Update precheck to use gear-contact count consistency 2
 from __future__ import annotations
 
 import os
@@ -35,6 +34,9 @@ TARGET_STAGE_COUNT = int(os.environ.get("LF_TARGET_STAGE_COUNT", "6"))
 # Student-facing message policy
 # ----------------------------
 MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
+    "parts_inventory": {
+        "fail": "Some parts could not be detected clearly. Please separate the parts and retake the photo.",
+    },
     "precheck": {
         "pass": "Good photo. You can proceed.",
         "fail": "Please retake the photo. The image is not suitable for reliable checking.",
@@ -157,6 +159,13 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
     def keep(e: Dict[str, Any]) -> bool:
         code = str(e.get("code", "")).upper()
 
+        if task == "parts_inventory":
+            return code in {
+                "E_PARTS_COUNT_MISMATCH",
+                "E_BAD_PART_TYPE",
+                "E_NO_TARGET_PARTS",
+            }
+
         if task == "precheck":
             return code in {
                 "E_PRECHECK_COUNT_RULE_FAIL",
@@ -219,6 +228,46 @@ def _format_rpm_value(out_rpm: Any) -> str:
         return str(out_rpm)
 
 
+def _build_parts_inventory_message(out: Dict[str, Any], part_type: str) -> Tuple[bool, str]:
+    counts = out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
+    errors = out.get("errors", []) if isinstance(out.get("errors"), list) else []
+
+    is_correct = len(errors) == 0
+    part_type = str(part_type or "").strip().lower()
+
+    if part_type == "gear":
+        msg = (
+            "Detected gears:\n"
+            f"- biggear: {counts.get('biggear', 0)}\n"
+            f"- smallgear: {counts.get('smallgear', 0)}"
+        )
+        if not is_correct:
+            msg += "\nPlease spread the gears out clearly and retake the photo."
+        return is_correct, msg
+
+    if part_type == "shaft":
+        msg = (
+            "Detected shafts:\n"
+            f"- long shaft: {counts.get('shaft_long', 0)}\n"
+            f"- short shaft: {counts.get('shaft_short', 0)}"
+        )
+        if not is_correct:
+            msg += "\nPlease separate the shafts and ensure both ends are clearly visible."
+        return is_correct, msg
+
+    if part_type == "spacer":
+        msg = (
+            "Detected spacers:\n"
+            f"- long spacer: {counts.get('spacer_long', 0)}\n"
+            f"- short spacer: {counts.get('spacer_short', 0)}"
+        )
+        if not is_correct:
+            msg += "\nPlease place the spacers separately and retake the photo."
+        return is_correct, msg
+
+    return False, "Unsupported part type."
+
+
 def _build_student_message(
     *,
     task: str,
@@ -226,11 +275,15 @@ def _build_student_message(
     out: Dict[str, Any],
     errors: List[Dict[str, Any]],
     selected_errors: List[Dict[str, Any]],
+    part_type: str = "",
 ) -> Tuple[bool, str]:
     task = (task or "full").strip().lower()
 
     if task == "full":
         task = "mesh_ratio"
+
+    if task == "parts_inventory":
+        return _build_parts_inventory_message(out, part_type)
 
     if task not in ("precheck", "shaft", "spacer", "gear_inventory", "mesh_ratio"):
         task = "mesh_ratio"
@@ -370,6 +423,7 @@ def _build_student_message(
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     task = str(_pget(params, "task", "full") or "full").strip().lower()
+    part_type = str(_pget(params, "part_type", "") or "").strip().lower()
 
     if task == "full":
         pipeline_task = "full"
@@ -408,6 +462,7 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             shaft_model_rel=shaft_model_rel,
             return_images=(return_images and pipeline_task != "precheck"),
             task=pipeline_task,
+            part_type=part_type,
             expected_gears=expected_gears,
         )
     except TypeError:
@@ -416,6 +471,8 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
             gear_model_rel=gear_model_rel,
             shaft_model_rel=shaft_model_rel,
             return_images=(return_images and pipeline_task != "precheck"),
+            task=pipeline_task,
+            expected_gears=expected_gears,
         )
     except Exception:
         return _result_minimal(
@@ -432,5 +489,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         out=out,
         errors=errors,
         selected_errors=selected_errors,
+        part_type=part_type,
     )
     return _result_minimal(is_correct, msg)
