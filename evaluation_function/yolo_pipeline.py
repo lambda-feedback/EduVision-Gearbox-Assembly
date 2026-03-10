@@ -1,32 +1,21 @@
 """
 YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
 
-Design goal (as requested):
-- Always run a shared "base detection pass" for every task:
-    1) load gear+shaft models (cached per-process)
-    2) run gear detection
-    3) run shaft OBB detection
-    4) build objects (gears/spacers/mesh/mismesh)
-    5) pick gear11
-    6) assign gears/spacers to shafts (gear_to_si / spacer_to_si)
-- Then run ONLY the task-specific rules/checks and filter outputs for step-wise UI.
-
-Tasks:
-- task="shaft"          -> uses gear11-distance rule to define shaft2/shaft3, checks shaft2 class mismatch
-- task="spacer"         -> runs assembly checks but filters to spacer errors (E_SPACER*)
-- task="gear_inventory" -> counts gears (+ big/small stats) and optional expected mismatch
-- task="mesh_ratio"     -> full pipeline (assembly checks + chain naming + ratio)
-- task="full"           -> same as mesh_ratio (legacy full behavior)
-
-Minimal-intrusive optimisations:
-1) Lazy-load ultralytics to reduce Lambda cold-start import time.
-2) Timing instrumentation (model load + inference + total time).
-3) Cold-start flag (per-process).
-
-NOTE:
-- This file assumes lazy_load.py is located at: evaluation_function/lazy_load.py
-  and provides LazyModule("...").
+Final streamlined version:
+- Keeps core detection and task logic
+- Removes overlay image generation and drawing utilities
+- Adds improved shaft-step logic:
+    1) missing shaft / wrong shaft count
+    2) two shafts of the same detected type
+    3) shaft_short / shaft_long position swap relative to gear11
+- Adds improved spacer-step logic:
+    1) missing spacer / wrong spacer count
+    2) missing short spacer / missing long spacer
+    3) two spacers of the same detected type
+    4) spacer position mismatch relative to expected shafts
+    5) spacer distance order mismatch relative to gear11
 """
+
 from __future__ import annotations
 
 import math
@@ -38,9 +27,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# =========================
-# Lazy import hooks
-# =========================
 from .lazy_load import LazyModule
 
 _ultralytics = LazyModule("ultralytics")
@@ -49,21 +35,19 @@ _COLD_START_FLAG = True
 if TYPE_CHECKING:
     from ultralytics import YOLO as _YOLO  # pragma: no cover
 else:
-    _YOLO = Any  # runtime typing fallback
+    _YOLO = Any
 
 
 # =========================
-# CONFIG (edit if needed)
+# CONFIG
 # =========================
 CONF_GEAR: float = 0.50
 CONF_SHAFT: float = 0.50
 
-# gear ratio constants
 MOTOR_RPM: float = 8000.0
 TEETH_BIG: int = 48
 TEETH_SMALL: int = 12
 
-# class names
 DRIVING_GEAR_CLASS_NAMES = {"Driving_Gear", "driving_gear", "DrivingGear"}
 GEAR_BIG_NAME = "Gear_big"
 GEAR_SMALL_NAME = "Gear_small"
@@ -77,14 +61,11 @@ SPACER_CLASSES = {
 }
 TARGET_SHAFT_CLASSES = {"shaft_long", "shaft_short"}
 
-# assignment robustness
 OBB_ASSIGN_SCALE: float = 1.10
 
-# contact-line sampling
 LINE_SAMPLES: int = 25
 LINE_HIT_RATIO_TH: float = 0.25
 
-# matching / naming config
 REQUIRE_DIFFERENT_SHAFT: bool = True
 REQUIRE_BIG_SMALL_PAIR: bool = True
 
@@ -100,26 +81,9 @@ W_GAP: float = 0.4
 NORM_DMS: float = 200.0
 NORM_GAP: float = 200.0
 
-# assembly checks
 ENABLE_ERROR_CHECKS: bool = True
 SPACER_DIST_TOL_PX: float = 5.0
 
-# drawing
-BOX_THICK: int = 2
-CENTER_R: int = 4
-
-LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
-LABEL_SCALE: float = 0.85
-LABEL_THICK: int = 2
-LABEL_PAD: int = 3
-LEADER_THICK: int = 2
-
-HUD_SCALE: float = 1.3
-HUD_THICK: int = 2
-HUD_LINE_GAP: int = 32
-HUD_X: int = 20
-HUD_Y0: int = 40
-HUD_COLOR = (0, 255, 255)
 
 # -------------------------
 # Task constants
@@ -133,7 +97,7 @@ _VALID_TASKS = {TASK_SHAFT, TASK_SPACER, TASK_GEAR_INV, TASK_MESH_RATIO, TASK_FU
 
 
 # =========================
-# Paths (relative)
+# Paths
 # =========================
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEAR_MODEL_REL = "gear_model.pt"
@@ -149,10 +113,6 @@ def _abs_model_path(rel_name: str) -> str:
 # =========================
 @lru_cache(maxsize=2)
 def _load_yolo_model(abs_path: str) -> Any:
-    """
-    Lazy-load ultralytics and load YOLO model from abs_path.
-    Cached per-process to avoid repeated initialisation cost.
-    """
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Model not found: {abs_path}")
 
@@ -165,9 +125,6 @@ def get_models(
     shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
     timing: Optional[Dict[str, float]] = None,
 ) -> Tuple[Any, Any]:
-    """
-    Load / fetch cached models. Optionally populate timing dict.
-    """
     t0 = time.perf_counter()
     gear_model = _load_yolo_model(_abs_model_path(gear_model_rel))
     t1 = time.perf_counter()
@@ -198,24 +155,6 @@ def bbox_wh(b: Tuple[float, float, float, float]) -> Tuple[float, float]:
 def est_radius_from_bbox(b: Tuple[float, float, float, float]) -> float:
     w, h = bbox_wh(b)
     return 0.5 * min(w, h)
-
-
-def put_text_outline(
-    img: np.ndarray,
-    text: str,
-    org: Tuple[float, float],
-    scale: float = 0.6,
-    thick: int = 2,
-    color: Tuple[int, int, int] = (0, 255, 0),
-) -> None:
-    x, y = int(org[0]), int(org[1])
-    cv2.putText(img, text, (x, y), LABEL_FONT, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), LABEL_FONT, scale, color, thick, cv2.LINE_AA)
-
-
-def draw_bbox(img: np.ndarray, b: Tuple[float, float, float, float], color: Tuple[int, int, int], thick: int = 2) -> None:
-    x1, y1, x2, y2 = map(int, b)
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
 
 
 def poly_center(pts4: np.ndarray) -> Tuple[float, float]:
@@ -270,95 +209,6 @@ def dist_point_to_segment(p: Tuple[float, float], a: Tuple[float, float], b: Tup
     cx, cy = ax + t * abx, ay + t * aby
     dx, dy = px - cx, py - cy
     return float((dx * dx + dy * dy) ** 0.5)
-
-
-# =========================
-# HUD drawer
-# =========================
-def draw_hud_lines(
-    img: np.ndarray,
-    lines: List[str],
-    x: int = HUD_X,
-    y0: int = HUD_Y0,
-    scale: float = HUD_SCALE,
-    thick: int = HUD_THICK,
-    color: Tuple[int, int, int] = HUD_COLOR,
-    line_gap: int = HUD_LINE_GAP,
-) -> None:
-    y = int(y0)
-    for s in lines:
-        put_text_outline(img, str(s), (x, y), scale=scale, thick=thick, color=color)
-        y += int(line_gap)
-
-
-# =========================
-# anti-overlap label placer
-# =========================
-def text_box_size(text: str, scale: float, thick: int) -> Tuple[int, int, int]:
-    (w, h), baseline = cv2.getTextSize(text, LABEL_FONT, scale, thick)
-    return w, h, baseline
-
-
-def rect_intersect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
-
-
-def place_label_no_overlap(
-    img: np.ndarray,
-    text: str,
-    anchor_xy: Tuple[float, float],
-    occupied_rects: List[Tuple[int, int, int, int]],
-    color: Tuple[int, int, int] = (0, 255, 0),
-    scale: float = LABEL_SCALE,
-    thick: int = LABEL_THICK,
-    pad: int = LABEL_PAD,
-    leader: bool = True,
-) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
-    H, W = img.shape[:2]
-    ax, ay = int(anchor_xy[0]), int(anchor_xy[1])
-    w, h, baseline = text_box_size(text, scale, thick)
-
-    offsets = [
-        (12, -12), (12, 18), (-w - 12, -12), (-w - 12, 18),
-        (12, -h - 18), (-w - 12, -h - 18),
-        (12, h + 24), (-w - 12, h + 24),
-        (18, 0), (-w - 18, 0),
-        (0, -18), (0, 30),
-    ]
-
-    best = None
-    best_collisions = 10**9
-
-    for dx, dy in offsets:
-        tx = ax + dx
-        ty = ay + dy
-        tx = max(pad, min(tx, W - w - pad))
-        ty = max(h + pad, min(ty, H - pad))
-
-        rect = (tx - pad, ty - h - pad, tx + w + pad, ty + baseline + pad)
-
-        collisions = 0
-        for r in occupied_rects:
-            if rect_intersect(rect, r):
-                collisions += 1
-
-        if collisions == 0:
-            put_text_outline(img, text, (tx, ty), scale=scale, thick=thick, color=color)
-            occupied_rects.append(rect)
-            if leader:
-                cv2.line(img, (ax, ay), (tx, ty - h // 2), (255, 255, 255), LEADER_THICK, cv2.LINE_AA)
-            return (tx, ty), rect
-
-        if collisions < best_collisions:
-            best_collisions = collisions
-            best = (tx, ty, rect)
-
-    tx, ty, rect = best
-    put_text_outline(img, text, (tx, ty), scale=scale, thick=thick, color=color)
-    occupied_rects.append(rect)
-    if leader:
-        cv2.line(img, (ax, ay), (tx, ty - h // 2), (255, 255, 255), LEADER_THICK, cv2.LINE_AA)
-    return (tx, ty), rect
 
 
 # =========================
@@ -423,26 +273,8 @@ def compute_ratio_and_rpm_from_stage_labels(
     return len(ratios), R_total, out_rpm, per_stage
 
 
-def highlight_gear_by_name(
-    img: np.ndarray,
-    gears: List[Dict[str, Any]],
-    gear_names: Dict[int, str],
-    target_name: str,
-    color: Tuple[int, int, int] = (0, 0, 255),
-    thick: int = 4,
-) -> None:
-    for g in gears:
-        gid = g["gid"]
-        if gear_names.get(gid) == target_name:
-            draw_bbox(img, g["bbox"], color, thick)
-            cx, cy = int(g["center"][0]), int(g["center"][1])
-            cv2.circle(img, (cx, cy), CENTER_R + 2, color, -1)
-            put_text_outline(img, f"{target_name} ({g['cls']})", (cx + 12, cy - 12), 0.85, 2, color)
-            break
-
-
 # =========================
-# Spacer type helpers
+# Spacer helpers
 # =========================
 def spacer_is_long(sp: Dict[str, Any]) -> bool:
     t = sp["cls"].lower().replace("_", " ")
@@ -462,6 +294,41 @@ def expected_contact_boxes_from_gear_count(gear_count: int) -> Tuple[Optional[in
     return (gear_count - 1) // 2, True
 
 
+# =========================
+# Shaft helpers
+# =========================
+def get_expected_shaft_indices_for_step(
+    gears: List[Dict[str, Any]],
+    shafts: List[Dict[str, Any]],
+    gear11_gid: int,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Return:
+      - short_shaft_idx: shaft expected to be closer to gear11
+      - long_shaft_idx: shaft expected to be farther from gear11
+    """
+    if not gears or not shafts or len(shafts) < 2:
+        return None, None
+
+    g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
+    if g11 is None:
+        return None, None
+
+    c11 = g11["center"]
+    dlist: List[Tuple[float, int]] = []
+    for i, s in enumerate(shafts):
+        dlist.append((center_dist(s["center"], c11), i))
+
+    dlist.sort(key=lambda x: x[0])
+
+    if len(dlist) < 2:
+        return None, None
+
+    short_shaft_idx = dlist[0][1]
+    long_shaft_idx = dlist[1][1]
+    return short_shaft_idx, long_shaft_idx
+
+
 def pick_shaft2_and_shaft3_by_distance(
     shafts: List[Dict[str, Any]],
     gear11_gid: int,
@@ -469,6 +336,7 @@ def pick_shaft2_and_shaft3_by_distance(
     gears: List[Dict[str, Any]],
 ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """
+    Legacy helper kept for compatibility with assembly checks.
     shaft1: shaft containing gear11
     shaft2/shaft3: by distance to gear11 (closest, 2nd closest), excluding shaft1
     """
@@ -494,6 +362,78 @@ def pick_shaft2_and_shaft3_by_distance(
     return shaft1, shaft2, shaft3
 
 
+def evaluate_shaft_step_errors(
+    gears: List[Dict[str, Any]],
+    shafts: List[Dict[str, Any]],
+    gear11_gid: int,
+) -> List[Dict[str, str]]:
+    """
+    Shaft-step specific rules:
+    1) expected exactly two shafts
+    2) expected one shaft_short and one shaft_long
+    3) shaft_short should be closer to gear11 than shaft_long
+    """
+    errs: List[Dict[str, str]] = []
+
+    if not gears:
+        errs.append({"code": "E_NO_GEARS", "message": "No gears detected."})
+        return errs
+
+    if len(shafts) == 0:
+        errs.append({"code": "E_SHAFT_COUNT_MISMATCH", "message": "No shafts detected."})
+        return errs
+
+    if len(shafts) == 1:
+        errs.append({"code": "E_SHAFT_COUNT_MISMATCH", "message": "Only one shaft detected."})
+        return errs
+
+    if len(shafts) != 2:
+        errs.append({
+            "code": "E_SHAFT_COUNT_MISMATCH",
+            "message": f"Expected 2 shafts, but detected {len(shafts)}."
+        })
+        return errs
+
+    g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
+    if g11 is None:
+        errs.append({"code": "E_NO_GEAR11", "message": "Cannot determine gear11."})
+        return errs
+
+    c11 = g11["center"]
+
+    shaft_info: List[Dict[str, Any]] = []
+    for i, s in enumerate(shafts):
+        shaft_info.append({
+            "index": i,
+            "cls": str(s["cls"]),
+            "dist": center_dist(s["center"], c11),
+        })
+
+    short_shafts = [s for s in shaft_info if s["cls"] == "shaft_short"]
+    long_shafts = [s for s in shaft_info if s["cls"] == "shaft_long"]
+
+    if len(short_shafts) != 1 or len(long_shafts) != 1:
+        errs.append({
+            "code": "E_SHAFT_TYPE_CONFUSION",
+            "message": "The shaft types could not be identified reliably."
+        })
+        return errs
+
+    short_dist = short_shafts[0]["dist"]
+    long_dist = long_shafts[0]["dist"]
+
+    if long_dist < short_dist:
+        errs.append({
+            "code": "E_SHAFT_POSITION_SWAP",
+            "message": "The shaft positions appear to be swapped."
+        })
+
+    return errs
+
+
+# =========================
+# Spacer helpers for step logic
+# =========================
 def pick_spacer_on_shaft_as(
     spacers: List[Dict[str, Any]],
     spacer_to_si: Dict[int, int],
@@ -513,6 +453,132 @@ def pick_spacer_on_shaft_as(
     return candidates[0][1]
 
 
+def evaluate_spacer_step_errors(
+    gears: List[Dict[str, Any]],
+    spacers: List[Dict[str, Any]],
+    shafts: List[Dict[str, Any]],
+    gear11_gid: int,
+    spacer_to_si: Dict[int, int],
+) -> List[Dict[str, str]]:
+    """
+    Spacer-step specific rules:
+    1) expected exactly two spacers
+    2) expected one spacer_short and one spacer_long
+    3) spacer_short should be on the shaft closer to gear11
+    4) spacer_long should be on the shaft farther from gear11
+    5) spacer_short should be closer to gear11 than spacer_long
+    """
+    errs: List[Dict[str, str]] = []
+
+    if not gears:
+        errs.append({"code": "E_NO_GEARS", "message": "No gears detected."})
+        return errs
+
+    if not shafts:
+        errs.append({"code": "E_NO_SHAFTS", "message": "No shafts detected."})
+        return errs
+
+    g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
+    if g11 is None:
+        errs.append({"code": "E_NO_GEAR11", "message": "Cannot determine gear11."})
+        return errs
+
+    c11 = g11["center"]
+
+    # -------------------------
+    # Count / presence checks
+    # -------------------------
+    if len(spacers) == 0:
+        errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "No spacers detected."})
+        return errs
+
+    if len(spacers) == 1:
+        sp = spacers[0]
+        cls_name = str(sp["cls"]).lower().replace(" ", "_")
+
+        if "short" in cls_name:
+            errs.append({"code": "E_SPACER_LONG_MISSING", "message": "Only the short spacer was detected."})
+        elif "long" in cls_name:
+            errs.append({"code": "E_SPACER_SHORT_MISSING", "message": "Only the long spacer was detected."})
+        else:
+            errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "Only one spacer was detected."})
+        return errs
+
+    if len(spacers) != 2:
+        errs.append({
+            "code": "E_SPACER_COUNT_MISMATCH",
+            "message": f"Expected 2 spacers, but detected {len(spacers)}."
+        })
+        return errs
+
+    # -------------------------
+    # Type combination checks
+    # -------------------------
+    short_spacers = [sp for sp in spacers if spacer_is_short(sp)]
+    long_spacers = [sp for sp in spacers if spacer_is_long(sp)]
+
+    if len(short_spacers) == 0 and len(long_spacers) == 2:
+        errs.append({"code": "E_SPACER_TYPE_CONFUSION", "message": "Two long spacers were detected."})
+        return errs
+
+    if len(short_spacers) == 2 and len(long_spacers) == 0:
+        errs.append({"code": "E_SPACER_TYPE_CONFUSION", "message": "Two short spacers were detected."})
+        return errs
+
+    if len(short_spacers) != 1 or len(long_spacers) != 1:
+        errs.append({
+            "code": "E_SPACER_TYPE_CONFUSION",
+            "message": "The spacer types could not be identified reliably."
+        })
+        return errs
+
+    short_sp = short_spacers[0]
+    long_sp = long_spacers[0]
+
+    # -------------------------
+    # Shaft-position checks
+    # -------------------------
+    short_shaft_idx, long_shaft_idx = get_expected_shaft_indices_for_step(
+        gears=gears,
+        shafts=shafts,
+        gear11_gid=gear11_gid,
+    )
+
+    if short_shaft_idx is None or long_shaft_idx is None:
+        errs.append({
+            "code": "E_SPACER_POSITION_MISMATCH",
+            "message": "Cannot determine the expected shaft positions for spacers."
+        })
+        return errs
+
+    short_sp_si = spacer_to_si.get(short_sp["sid"])
+    long_sp_si = spacer_to_si.get(long_sp["sid"])
+
+    if short_sp_si != short_shaft_idx or long_sp_si != long_shaft_idx:
+        errs.append({
+            "code": "E_SPACER_POSITION_MISMATCH",
+            "message": "The spacer positions appear to be incorrect."
+        })
+        return errs
+
+    # -------------------------
+    # Distance-order check
+    # -------------------------
+    d_short = center_dist(short_sp["center"], c11)
+    d_long = center_dist(long_sp["center"], c11)
+
+    if d_short > d_long + float(SPACER_DIST_TOL_PX):
+        errs.append({
+            "code": "E_SPACER_DISTANCE_ORDER",
+            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={SPACER_DIST_TOL_PX}px)."
+        })
+
+    return errs
+
+
+# =========================
+# Assembly checks for full path
+# =========================
 def evaluate_assembly_errors(
     gears: List[Dict[str, Any]],
     spacers: List[Dict[str, Any]],
@@ -527,7 +593,6 @@ def evaluate_assembly_errors(
     if not gears:
         return errs
 
-    # Rule 1: mismesh present
     if len(mismesh_boxes) > 0:
         errs.append({
             "code": "E_MISMESH_DETECTED",
@@ -541,7 +606,6 @@ def evaluate_assembly_errors(
 
     shaft1, shaft2, shaft3 = pick_shaft2_and_shaft3_by_distance(shafts, gear11_gid, gear_to_si, gears)
 
-    # Rule 2: shaft2 should be shaft_short
     if shaft2 is not None and 0 <= shaft2 < len(shafts):
         if str(shafts[shaft2]["cls"]) == "shaft_long":
             errs.append({
@@ -549,39 +613,33 @@ def evaluate_assembly_errors(
                 "message": "Assembly issue: shaft2 (closest shaft to gear11) is classified as 'shaft_long' (expected 'shaft_short')."
             })
 
-    # spacer2/spacer3 by containment assignment
     spacer2 = pick_spacer_on_shaft_as(spacers, spacer_to_si, shaft2, c11) if shaft2 is not None else None
     spacer3 = pick_spacer_on_shaft_as(spacers, spacer_to_si, shaft3, c11) if shaft3 is not None else None
 
-    # Rule 3A: spacer2 exists and must be short
     if shaft2 is not None:
         if spacer2 is None:
             errs.append({
                 "code": "E_SPACER2_MISSING",
                 "message": "Assembly issue: no spacer found on shaft2 (spacer2 missing or not assigned to shaft2)."
             })
-        else:
-            if spacer_is_long(spacer2):
-                errs.append({
-                    "code": "E_SPACER2_TYPE_MISMATCH",
-                    "message": "Assembly issue: spacer2 (spacer on shaft2) is classified as 'long spacer' (expected 'short spacer')."
-                })
+        elif spacer_is_long(spacer2):
+            errs.append({
+                "code": "E_SPACER2_TYPE_MISMATCH",
+                "message": "Assembly issue: spacer2 (spacer on shaft2) is classified as 'long spacer' (expected 'short spacer')."
+            })
 
-    # Rule 3B: spacer3 exists and should be long
     if shaft3 is not None:
         if spacer3 is None:
             errs.append({
                 "code": "E_SPACER3_MISSING",
                 "message": "Assembly issue: no spacer found on shaft3 (spacer3 missing or not assigned to shaft3)."
             })
-        else:
-            if spacer_is_short(spacer3):
-                errs.append({
-                    "code": "E_SPACER3_TYPE_MISMATCH",
-                    "message": "Assembly issue: spacer3 (spacer on shaft3) is classified as 'short spacer' (expected 'long spacer')."
-                })
+        elif spacer_is_short(spacer3):
+            errs.append({
+                "code": "E_SPACER3_TYPE_MISMATCH",
+                "message": "Assembly issue: spacer3 (spacer on shaft3) is classified as 'short spacer' (expected 'long spacer')."
+            })
 
-    # Extra sanity: spacer2 closer to gear11 than spacer3
     if spacer2 is not None and spacer3 is not None:
         d2 = center_dist(spacer2["center"], c11)
         d3 = center_dist(spacer3["center"], c11)
@@ -591,7 +649,6 @@ def evaluate_assembly_errors(
                 "message": f"Consistency check: spacer2 is not closer to gear11 than spacer3 (tol={SPACER_DIST_TOL_PX}px)."
             })
 
-    # Rule 4: contact boxes count
     total_contact = len(mesh_boxes) + len(mismesh_boxes)
     expected, ok = expected_contact_boxes_from_gear_count(len(gears))
     if not ok:
@@ -646,7 +703,6 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
         for row in rows:
             pts: Optional[np.ndarray] = None
 
-            # case A: poly8 + conf + cls (len >= 10)
             if len(row) >= 10:
                 poly8 = row[:8]
                 conf = float(row[8])
@@ -663,7 +719,6 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
                     [poly8[6], poly8[7]],
                 ], dtype=np.float32)
 
-            # case B: (cx,cy,w,h,ang,conf,cls) (len >= 7)
             elif len(row) >= 7:
                 cx, cy, w, h, ang = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])
                 conf = float(row[5])
@@ -810,7 +865,7 @@ def is_big(gear: Dict[str, Any], median_r: float) -> bool:
 
 
 # =========================
-# Contact-box scoring + chain naming (unchanged)
+# Contact-box scoring + chain naming
 # =========================
 def score_pair_by_contact_box(
     gA: Dict[str, Any],
@@ -857,9 +912,8 @@ def find_best_mate_for(
         if REQUIRE_DIFFERENT_SHAFT and (siA is not None) and (siB is not None) and (siA == siB):
             continue
 
-        if REQUIRE_BIG_SMALL_PAIR:
-            if is_big(gA, median_r) == is_big(gB, median_r):
-                continue
+        if REQUIRE_BIG_SMALL_PAIR and (is_big(gA, median_r) == is_big(gB, median_r)):
+            continue
 
         best_local = None
         for cidx, box in enumerate(contact_boxes):
@@ -1079,28 +1133,20 @@ def stage_role_naming_chain(
 
 
 # =========================
-# Task-result helpers (packaging only)
+# Task-result helpers
 # =========================
 def _has_E(errors: List[Dict[str, Any]]) -> bool:
     return any(isinstance(e, dict) and str(e.get("code", "")).startswith("E_") for e in errors)
 
 
-def _task_result(task: str, errors: List[Dict[str, Any]], focus: List[str], next_task: str, extra: Optional[List[str]] = None) -> Dict[str, Any]:
+def _task_result(task: str, errors: List[Dict[str, Any]], focus: List[str], next_task: str) -> Dict[str, Any]:
     fail = _has_E(errors)
-    msgs: List[str] = []
-    if extra:
-        msgs.extend(extra)
-    for e in errors[:6]:
-        if isinstance(e, dict):
-            m = str(e.get("message", "")).strip()
-            c = str(e.get("code", "")).strip()
-            msgs.append(m if m else c)
     return {
         "task": task,
         "status": "FAIL" if fail else "PASS",
         "is_ready_for_next": (not fail),
         "focus": focus,
-        "messages": msgs,
+        "messages": [str(e.get("message", "")) for e in errors[:6] if isinstance(e, dict)],
         "recommended_next_task": next_task,
     }
 
@@ -1123,23 +1169,11 @@ def run_yolo_pipeline(
     img_bgr: np.ndarray,
     gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
     shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
-    return_images: bool = False,
+    return_images: bool = False,  # kept for compatibility, currently unused
     *,
     task: str = TASK_FULL,
     expected_gears: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Always-base-detect pipeline:
-    - Always runs gear+shaft detections and builds core objects/assignments.
-    - Then applies task-specific rules and filters outputs.
-
-    task:
-      - "shaft"
-      - "spacer"
-      - "gear_inventory"
-      - "mesh_ratio"
-      - "full"
-    """
     if img_bgr is None or not hasattr(img_bgr, "shape"):
         raise ValueError("img_bgr must be a valid OpenCV image (BGR).")
 
@@ -1154,9 +1188,6 @@ def run_yolo_pipeline(
     t0_total = time.perf_counter()
     timing: Dict[str, float] = {}
 
-    # -------------------------------------------------
-    # A) ALWAYS: load both models + run both detections
-    # -------------------------------------------------
     gear_model, shaft_model = get_models(gear_model_rel, shaft_model_rel, timing=timing)
 
     t_g0 = time.perf_counter()
@@ -1170,7 +1201,6 @@ def run_yolo_pipeline(
     gears, spacers, mesh_boxes, mismesh_boxes = build_objects(gear_dets)
     contact_boxes = list(mesh_boxes) + list(mismesh_boxes)
 
-    # gear11 + assignments (only if possible)
     gear11_gid: Optional[int] = None
     gear_to_si: Dict[int, int] = {}
     spacer_to_si: Dict[int, int] = {}
@@ -1182,19 +1212,14 @@ def run_yolo_pipeline(
     if gears and shaft_obbs:
         gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
 
-    # -------------------------------------------------
-    # B) TASK-SPECIFIC RULES / FILTERING
-    # -------------------------------------------------
     errors_all: List[Dict[str, str]] = []
 
-    # prerequisites (for tasks that need them)
     def _need_gears() -> bool:
         return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL, TASK_GEAR_INV)
 
     def _need_shafts() -> bool:
         return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL)
 
-    # Always attach these if missing and needed
     if _need_gears() and not gears:
         errors_all.append({"code": "E_NO_GEARS", "message": "No gears detected."})
     if _need_shafts() and not shaft_obbs:
@@ -1202,7 +1227,6 @@ def run_yolo_pipeline(
 
     # --- task: gear_inventory ---
     if task == TASK_GEAR_INV:
-        # big/small stats
         big_cnt = 0
         small_cnt = 0
         if gears:
@@ -1217,11 +1241,15 @@ def run_yolo_pipeline(
             try:
                 exp = int(expected_gears)
                 if len(gears) != exp:
-                    errors_all.append({"code": "E_GEAR_COUNT_MISMATCH", "message": f"Gear inventory: detected {len(gears)}, expected {exp}."})
+                    errors_all.append({
+                        "code": "E_GEAR_COUNT_MISMATCH",
+                        "message": f"Gear inventory: detected {len(gears)}, expected {exp}."
+                    })
             except Exception:
                 pass
 
         errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_GEAR_COUNT", "E_GEAR"))
+
         out: Dict[str, Any] = {
             "summary": {
                 "gears": len(gears),
@@ -1241,81 +1269,34 @@ def run_yolo_pipeline(
                 errors,
                 focus=["gears"],
                 next_task=TASK_MESH_RATIO,
-                extra=["Step D: Gear presence & type (inventory)."],
             ),
+            "timing": {},
         }
-
         timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
         out["timing"] = timing
-        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
-
-        if return_images:
-            det_img = img_bgr.copy()
-            label_img = img_bgr.copy()
-
-            # draw gears + spacers + mesh boxes (inventory)
-            for b in mesh_boxes:
-                draw_bbox(det_img, b, (255, 255, 0), 2)
-                put_text_outline(det_img, "Mesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 255, 0))
-            for b in mismesh_boxes:
-                draw_bbox(det_img, b, (255, 0, 255), 2)
-                put_text_outline(det_img, "Mismesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 0, 255))
-
-            for sp in spacers:
-                draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
-                put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
-                cv2.circle(det_img, (int(sp["center"][0]), int(sp["center"][1])), CENTER_R, (0, 255, 255), -1)
-
-            for g in gears:
-                draw_bbox(det_img, g["bbox"], (0, 255, 0), 2)
-                cx, cy = int(g["center"][0]), int(g["center"][1])
-                cv2.circle(det_img, (cx, cy), CENTER_R, (0, 0, 255), -1)
-                put_text_outline(det_img, f"{g['cls']} {g['score']:.2f}", (g["bbox"][0] + 3, g["bbox"][1] - 6), 0.55, 2, (0, 255, 0))
-
-            hud = [
-                f"Gears: {len(gears)} (big={big_cnt}, small={small_cnt})",
-                f"Spacers: {len(spacers)}  Shafts: {len(shaft_obbs)}",
-            ]
-            if errors:
-                hud.append("---- ISSUES ----")
-                hud += [e["message"] for e in errors[:6]]
-            else:
-                hud.append("Issues: None")
-
-            draw_hud_lines(det_img, hud)
-            draw_hud_lines(label_img, hud)
-            out["images"] = {"det_img": det_img, "label_img": label_img}
-
         return out
 
     # --- task: shaft ---
     if task == TASK_SHAFT:
-        # if prerequisites failed, just return those
         if errors_all:
             errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
         else:
-            # gear11-distance shaft2/shaft3 and rule on shaft2 class
-            errors_all_local: List[Dict[str, str]] = []
-
             if gear11_gid is None:
-                errors_all_local.append({"code": "E_NO_GEAR11", "message": "Cannot determine gear11 (driving gear) from detections."})
+                errors_all_local: List[Dict[str, str]] = [{
+                    "code": "E_NO_GEAR11",
+                    "message": "Cannot determine gear11 (driving gear) from detections."
+                }]
             else:
-                _shaft1, shaft2, _shaft3 = pick_shaft2_and_shaft3_by_distance(
+                errors_all_local = evaluate_shaft_step_errors(
+                    gears=gears,
                     shafts=shaft_obbs,
                     gear11_gid=gear11_gid,
-                    gear_to_si=gear_to_si,
-                    gears=gears,
                 )
-                if shaft2 is None:
-                    errors_all_local.append({"code": "E_SHAFT2_NOT_FOUND", "message": "Cannot determine shaft2 (closest shaft to gear11)."})
-                else:
-                    if str(shaft_obbs[shaft2]["cls"]) == "shaft_long":
-                        errors_all_local.append({
-                            "code": "E_SHAFT2_CLASS_MISMATCH",
-                            "message": "Shaft check: shaft2 (closest shaft to gear11) is classified as 'shaft_long' (expected 'shaft_short')."
-                        })
 
-            errors = _filter_errors_by_prefix(errors_all_local, prefixes=("E_SHAFT", "E_NO_GEAR11"))
+            errors = _filter_errors_by_prefix(
+                errors_all_local,
+                prefixes=("E_SHAFT", "E_NO_GEAR11")
+            )
 
         out = {
             "summary": {
@@ -1334,43 +1315,11 @@ def run_yolo_pipeline(
                 errors,
                 focus=["shafts"],
                 next_task=TASK_SPACER,
-                extra=["Step B: Shaft correctness (uses gear11-distance to define shaft2)."],
             ),
+            "timing": {},
         }
-
         timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
         out["timing"] = timing
-        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
-
-        if return_images:
-            det_img = img_bgr.copy()
-            label_img = img_bgr.copy()
-
-            # draw shafts only (for clarity)
-            for s in shaft_obbs:
-                poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
-                put_text_outline(det_img, f"{s['cls']} {s['score']:.2f}", (s["center"][0] + 6, s["center"][1] + 6), 0.55, 2, (255, 255, 255))
-
-            # optionally mark gear11 center (small dot) without showing all gears
-            if gear11_gid is not None:
-                g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
-                if g11 is not None:
-                    cx, cy = int(g11["center"][0]), int(g11["center"][1])
-                    cv2.circle(det_img, (cx, cy), CENTER_R + 2, (0, 0, 255), -1)
-                    put_text_outline(det_img, "gear11(ref)", (cx + 10, cy - 10), 0.6, 2, (0, 0, 255))
-
-            hud = [f"Shafts: {len(shaft_obbs)}  Gears: {len(gears)}"]
-            if errors:
-                hud.append("---- ISSUES ----")
-                hud += [e["message"] for e in errors[:6]]
-            else:
-                hud.append("Issues: None")
-
-            draw_hud_lines(det_img, hud)
-            draw_hud_lines(label_img, hud)
-            out["images"] = {"det_img": det_img, "label_img": label_img}
-
         return out
 
     # --- task: spacer ---
@@ -1378,20 +1327,24 @@ def run_yolo_pipeline(
         if errors_all:
             errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
         else:
-            # reuse existing assembly checks; filter to spacer errors
-            errors_all_local = []
-            if ENABLE_ERROR_CHECKS and gear11_gid is not None:
-                errors_all_local = evaluate_assembly_errors(
+            if gear11_gid is None:
+                errors_all_local: List[Dict[str, str]] = [{
+                    "code": "E_NO_GEAR11",
+                    "message": "Cannot determine gear11 (driving gear) from detections."
+                }]
+            else:
+                errors_all_local = evaluate_spacer_step_errors(
                     gears=gears,
                     spacers=spacers,
                     shafts=shaft_obbs,
-                    mesh_boxes=mesh_boxes,
-                    mismesh_boxes=mismesh_boxes,
                     gear11_gid=gear11_gid,
-                    gear_to_si=gear_to_si,
                     spacer_to_si=spacer_to_si,
                 )
-            errors = _filter_errors_by_prefix(errors_all_local, prefixes=("E_SPACER",))
+
+            errors = _filter_errors_by_prefix(
+                errors_all_local,
+                prefixes=("E_SPACER", "E_NO_GEAR11")
+            )
 
         out = {
             "summary": {
@@ -1410,45 +1363,14 @@ def run_yolo_pipeline(
                 errors,
                 focus=["spacers"],
                 next_task=TASK_GEAR_INV,
-                extra=["Step C: Spacer correctness (presence/type/order)."],
             ),
+            "timing": {},
         }
-
         timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
         out["timing"] = timing
-        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
-
-        if return_images:
-            det_img = img_bgr.copy()
-            label_img = img_bgr.copy()
-
-            # draw shafts + spacers for this step
-            for s in shaft_obbs:
-                poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
-
-            for sp in spacers:
-                draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
-                put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
-                cv2.circle(det_img, (int(sp["center"][0]), int(sp["center"][1])), CENTER_R, (0, 255, 255), -1)
-
-            hud = [f"Shafts: {len(shaft_obbs)}  Spacers: {len(spacers)}"]
-            if errors:
-                hud.append("---- ISSUES ----")
-                hud += [e["message"] for e in errors[:6]]
-            else:
-                hud.append("Issues: None")
-
-            draw_hud_lines(det_img, hud)
-            draw_hud_lines(label_img, hud)
-            out["images"] = {"det_img": det_img, "label_img": label_img}
-
         return out
 
-    # -------------------------------------------------
-    # task=mesh_ratio OR task=full -> FULL logic
-    # -------------------------------------------------
-    # If missing gears, return early (consistent with previous behavior)
+    # --- task: mesh_ratio / full ---
     if not gears:
         out = {
             "summary": {
@@ -1465,26 +1387,21 @@ def run_yolo_pipeline(
             "chain_pairs": [],
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
+                [{"code": "E_NO_GEARS", "message": "No gears detected."}],
+                focus=["mesh_ratio"],
+                next_task=TASK_SHAFT,
+            ),
+            "timing": {},
         }
         timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
         out["timing"] = timing
-        out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
-        out["task_result"] = _task_result(
-            TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
-            out["errors"],
-            focus=["mesh_ratio"],
-            next_task=TASK_SHAFT,
-            extra=["Step E: Mesh & ratio requires gears."],
-        )
-        if return_images:
-            out["images"] = {"det_img": img_bgr.copy(), "label_img": img_bgr.copy()}
         return out
 
-    # Full path
     if gear11_gid is None:
         gear11_gid = pick_driving_gear(gears)["gid"]
 
-    # Ensure assignments exist (if shafts exist)
     if gears and shaft_obbs and not gear_to_si:
         gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
 
@@ -1550,101 +1467,15 @@ def run_yolo_pipeline(
         },
         "errors": errors,
         "cold_start": bool(is_cold_start),
+        "task_result": _task_result(
+            TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
+            errors,
+            focus=["mesh_ratio"],
+            next_task=TASK_FULL,
+        ),
+        "timing": {},
     }
 
-    out["task_result"] = _task_result(
-        TASK_MESH_RATIO if task == TASK_MESH_RATIO else TASK_FULL,
-        errors,
-        focus=["mesh_ratio"],
-        next_task=TASK_FULL,
-        extra=["Step E: Meshing & ratio (functional performance)."],
-    )
-
-    # ---- timings/debug ----
     timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
     out["timing"] = timing
-    out["debug_env"] = {"MODEL_DIR": os.environ.get("MODEL_DIR", "")}
-
-    # ---- images (full drawing) ----
-    if return_images:
-        det_img = img_bgr.copy()
-        label_img = img_bgr.copy()
-
-        # shafts
-        for s in shaft_obbs:
-            poly = s["poly4"].astype(np.int32).reshape((-1, 1, 2))
-            cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
-            put_text_outline(det_img, f"{s['cls']} {s['score']:.2f}", (s["center"][0] + 6, s["center"][1] + 6), 0.55, 2, (255, 255, 255))
-
-        # mesh / mismesh
-        for b in mesh_boxes:
-            draw_bbox(det_img, b, (255, 255, 0), 2)
-            put_text_outline(det_img, "Mesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 255, 0))
-        for b in mismesh_boxes:
-            draw_bbox(det_img, b, (255, 0, 255), 2)
-            put_text_outline(det_img, "Mismesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 0, 255))
-
-        # spacers
-        for sp in spacers:
-            draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
-            put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
-            cv2.circle(det_img, (int(sp["center"][0]), int(sp["center"][1])), CENTER_R, (0, 255, 255), -1)
-
-        # gears
-        for g in gears:
-            draw_bbox(det_img, g["bbox"], (0, 255, 0), 2)
-            cx, cy = int(g["center"][0]), int(g["center"][1])
-            cv2.circle(det_img, (cx, cy), CENTER_R, (0, 0, 255), -1)
-            put_text_outline(det_img, f"{g['cls']} {g['score']:.2f}", (g["bbox"][0] + 3, g["bbox"][1] - 6), 0.55, 2, (0, 255, 0))
-
-        # labels with anti-overlap
-        occupied: List[Tuple[int, int, int, int]] = []
-        for g in gears:
-            gid = g["gid"]
-            if gid not in gear_names:
-                continue
-            nm = gear_names[gid]
-            cx, cy = g["center"]
-            put_text_outline(det_img, nm, (cx + 10, cy + 10), 0.75, 2, (0, 255, 0))
-            place_label_no_overlap(label_img, nm, (cx, cy), occupied, color=(0, 255, 0), scale=0.90, thick=2, leader=True)
-
-        # chain lines
-        for (gidA, gidB, hit, _box) in chain_pairs:
-            gA = gears_by_gid(gears, gidA)
-            gB = gears_by_gid(gears, gidB)
-            p1 = (int(gA["center"][0]), int(gA["center"][1]))
-            p2 = (int(gB["center"][0]), int(gB["center"][1]))
-            cv2.line(det_img, p1, p2, (255, 255, 255), 2, cv2.LINE_AA)
-            mid = (int((p1[0] + p2[0]) * 0.5), int((p1[1] + p2[1]) * 0.5))
-            put_text_outline(det_img, f"contact:{hit:.2f}", (mid[0] + 6, mid[1] + 6), 0.55, 2, (255, 255, 255))
-
-        # HUD
-        hud_lines: List[str] = [
-            f"Gears: {len(gears)}  Spacers: {len(spacers)}  Shafts: {len(shaft_obbs)}",
-            f"Stages: {num_stages}",
-        ]
-        if R_total is None or out_rpm is None:
-            hud_lines += ["Total ratio: N/A", "Output speed: N/A"]
-        else:
-            hud_lines += [f"Total ratio: {R_total:.3f}", f"Output speed: {out_rpm:.1f} RPM"]
-            for (s, R, z1, z2) in per_stage:
-                hud_lines.append(f"Stage{s}: {z2}/{z1}={R:.2f}")
-
-        if ENABLE_ERROR_CHECKS:
-            if errors:
-                hud_lines.append("---- ISSUES ----")
-                hud_lines += [e["message"] for e in errors[:6]]
-            else:
-                hud_lines.append("Issues: None")
-
-        draw_hud_lines(det_img, hud_lines)
-        draw_hud_lines(label_img, hud_lines)
-
-        highlight_gear_by_name(det_img, gears, gear_names, "gear11", color=(0, 0, 255), thick=5)
-        highlight_gear_by_name(det_img, gears, gear_names, "gear12", color=(0, 165, 255), thick=5)
-        highlight_gear_by_name(label_img, gears, gear_names, "gear11", color=(0, 0, 255), thick=5)
-        highlight_gear_by_name(label_img, gears, gear_names, "gear12", color=(0, 165, 255), thick=5)
-
-        out["images"] = {"det_img": det_img, "label_img": label_img}
-
     return out

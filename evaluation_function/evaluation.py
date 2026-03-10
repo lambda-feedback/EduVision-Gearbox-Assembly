@@ -43,11 +43,20 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     },
     "shaft": {
         "pass": "Good. The shaft setup looks correct.",
-        "fail": "Please check the shaft setup again. One or more shafts may be missing, misplaced, or of the wrong type.",
+        "count_fail": "A shaft may be missing or not detected. Please check whether both shafts are installed and retake the photo if needed.",
+        "type_confusion": "The shaft types could not be identified reliably. Please retake the photo from a clearer angle and make sure both shafts are fully visible.",
+        "position_swap": "The shaft positions appear to be incorrect. Please make sure the short shaft is closer to gear 1 and the long shaft is farther away.",
+        "fail": "Please check the shaft setup again.",
     },
     "spacer": {
         "pass": "Good. The spacer setup looks correct.",
-        "fail": "Please check the spacers again. One or more spacers may be missing, in the wrong position, or of the wrong type.",
+        "short_missing": "The short spacer may be missing or not detected. Please check whether the short spacer is installed and retake the photo if needed.",
+        "long_missing": "The long spacer may be missing or not detected. Please check whether the long spacer is installed and retake the photo if needed.",
+        "count_fail": "A spacer may be missing or not detected. Please check whether both spacers are installed and retake the photo if needed.",
+        "type_confusion": "The spacer types could not be identified reliably. Please retake the photo from a clearer angle and make sure both spacers are fully visible.",
+        "position_mismatch": "The spacer positions appear to be incorrect. Please make sure the short spacer is on the short shaft and the long spacer is on the long shaft.",
+        "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to gear 1 than the long spacer.",
+        "fail": "Please check the spacer setup again.",
     },
     "gear_inventory": {
         "pass": "Good. The gear count looks correct.",
@@ -153,7 +162,6 @@ def _result_minimal(is_correct: bool, message: str, *, max_chars: int = _MAX_FEE
 
 # ----------------------------
 # Internal image quality checks
-# Used for judgement, not directly shown in final student feedback.
 # ----------------------------
 def _image_quality_checks(img_bgr: np.ndarray) -> List[str]:
     lines: List[str] = []
@@ -213,7 +221,12 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
             return code.startswith("E_SHAFT") or code == "E_NO_SHAFTS" or code == "E_NO_GEAR11"
 
         if task == "spacer":
-            return code.startswith("E_SPACER") or code == "E_NO_SHAFTS" or code == "E_NO_GEARS"
+            return (
+                code.startswith("E_SPACER")
+                or code == "E_NO_SHAFTS"
+                or code == "E_NO_GEARS"
+                or code == "E_NO_GEAR11"
+            )
 
         if task == "gear_inventory":
             return code in {"E_NO_GEARS", "E_GEAR_COUNT_MISMATCH", "E_GEAR_COUNT_UNSUPPORTED"}
@@ -294,6 +307,68 @@ def _build_student_message(
 
     is_correct = not _has_pipeline_error(errors)
 
+    if task == "shaft":
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
+
+        if (
+            "E_SHAFT_COUNT_MISMATCH" in codes
+            or "E_NO_SHAFTS" in codes
+            or "E_SHAFT2_NOT_FOUND" in codes
+        ):
+            return False, MESSAGE_POLICY["shaft"]["count_fail"]
+
+        if (
+            "E_SHAFT_TYPE_CONFUSION" in codes
+            or "E_SHAFT2_CLASS_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
+
+        if "E_SHAFT_POSITION_SWAP" in codes:
+            return False, MESSAGE_POLICY["shaft"]["position_swap"]
+
+        if not is_correct:
+            return False, MESSAGE_POLICY["shaft"]["fail"]
+
+        return True, MESSAGE_POLICY["shaft"]["pass"]
+
+    if task == "spacer":
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
+
+        if "E_SPACER_SHORT_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["short_missing"]
+
+        if "E_SPACER_LONG_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["long_missing"]
+
+        if "E_SPACER_COUNT_MISMATCH" in codes:
+            return False, MESSAGE_POLICY["spacer"]["count_fail"]
+
+        if "E_SPACER_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["spacer"]["type_confusion"]
+
+        if (
+            "E_SPACER_POSITION_MISMATCH" in codes
+            or "E_SPACER2_TYPE_MISMATCH" in codes
+            or "E_SPACER3_TYPE_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["spacer"]["position_mismatch"]
+
+        if "E_SPACER_DISTANCE_ORDER" in codes:
+            return False, MESSAGE_POLICY["spacer"]["distance_order"]
+
+        if not is_correct:
+            return False, MESSAGE_POLICY["spacer"]["fail"]
+
+        return True, MESSAGE_POLICY["spacer"]["pass"]
+
     if task == "mesh_ratio":
         if not is_correct:
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
@@ -341,8 +416,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     """
     task = str(_pget(params, "task", "full") or "full").strip().lower()
 
-    # Keep "full" as a backward-compatible alias for the pipeline,
-    # but use "mesh_ratio" for message rendering.
     if task == "full":
         pipeline_task = "full"
         message_task = "mesh_ratio"
