@@ -4,6 +4,9 @@ YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
 Final streamlined version:
 - Keeps core detection and task logic
 - Removes overlay image generation and drawing utilities
+- Adds precheck logic:
+    1) checks only the consistency rule between gear count and (mesh + mismesh) count
+    2) does not separately decide whether gears or contacts are wrong
 - Adds improved shaft-step logic:
     1) missing shaft / wrong shaft count
     2) two shafts of the same detected type
@@ -88,12 +91,13 @@ SPACER_DIST_TOL_PX: float = 5.0
 # -------------------------
 # Task constants
 # -------------------------
+TASK_PRECHECK = "precheck"
 TASK_SHAFT = "shaft"
 TASK_SPACER = "spacer"
 TASK_GEAR_INV = "gear_inventory"
 TASK_MESH_RATIO = "mesh_ratio"
 TASK_FULL = "full"
-_VALID_TASKS = {TASK_SHAFT, TASK_SPACER, TASK_GEAR_INV, TASK_MESH_RATIO, TASK_FULL}
+_VALID_TASKS = {TASK_PRECHECK, TASK_SHAFT, TASK_SPACER, TASK_GEAR_INV, TASK_MESH_RATIO, TASK_FULL}
 
 
 # =========================
@@ -294,6 +298,40 @@ def expected_contact_boxes_from_gear_count(gear_count: int) -> Tuple[Optional[in
     return (gear_count - 1) // 2, True
 
 
+def evaluate_precheck_count_rule(
+    gears: List[Dict[str, Any]],
+    mesh_boxes: List[Tuple[float, float, float, float]],
+    mismesh_boxes: List[Tuple[float, float, float, float]],
+) -> List[Dict[str, str]]:
+    errs: List[Dict[str, str]] = []
+
+    gear_count = len(gears)
+    total_contact = len(mesh_boxes) + len(mismesh_boxes)
+
+    expected_contact, ok = expected_contact_boxes_from_gear_count(gear_count)
+
+    if (not ok) or (expected_contact is None):
+        errs.append({
+            "code": "E_PRECHECK_COUNT_RULE_FAIL",
+            "message": (
+                f"Precheck failed: detected gear_count={gear_count}, which does not fit "
+                f"the expected contact rule."
+            ),
+        })
+        return errs
+
+    if total_contact != expected_contact:
+        errs.append({
+            "code": "E_PRECHECK_COUNT_RULE_FAIL",
+            "message": (
+                f"Precheck failed: mesh+mismesh={total_contact}, expected={expected_contact} "
+                f"for gear_count={gear_count}."
+            ),
+        })
+
+    return errs
+
+
 # =========================
 # Shaft helpers
 # =========================
@@ -485,9 +523,6 @@ def evaluate_spacer_step_errors(
 
     c11 = g11["center"]
 
-    # -------------------------
-    # Count / presence checks
-    # -------------------------
     if len(spacers) == 0:
         errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "No spacers detected."})
         return errs
@@ -511,9 +546,6 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
-    # -------------------------
-    # Type combination checks
-    # -------------------------
     short_spacers = [sp for sp in spacers if spacer_is_short(sp)]
     long_spacers = [sp for sp in spacers if spacer_is_long(sp)]
 
@@ -535,9 +567,6 @@ def evaluate_spacer_step_errors(
     short_sp = short_spacers[0]
     long_sp = long_spacers[0]
 
-    # -------------------------
-    # Shaft-position checks
-    # -------------------------
     short_shaft_idx, long_shaft_idx = get_expected_shaft_indices_for_step(
         gears=gears,
         shafts=shafts,
@@ -561,9 +590,6 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
-    # -------------------------
-    # Distance-order check
-    # -------------------------
     d_short = center_dist(short_sp["center"], c11)
     d_long = center_dist(long_sp["center"], c11)
 
@@ -1169,7 +1195,7 @@ def run_yolo_pipeline(
     img_bgr: np.ndarray,
     gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
     shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
-    return_images: bool = False,  # kept for compatibility, currently unused
+    return_images: bool = False,
     *,
     task: str = TASK_FULL,
     expected_gears: Optional[int] = None,
@@ -1215,7 +1241,7 @@ def run_yolo_pipeline(
     errors_all: List[Dict[str, str]] = []
 
     def _need_gears() -> bool:
-        return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL, TASK_GEAR_INV)
+        return task in (TASK_PRECHECK, TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL, TASK_GEAR_INV)
 
     def _need_shafts() -> bool:
         return task in (TASK_SHAFT, TASK_SPACER, TASK_MESH_RATIO, TASK_FULL)
@@ -1224,6 +1250,38 @@ def run_yolo_pipeline(
         errors_all.append({"code": "E_NO_GEARS", "message": "No gears detected."})
     if _need_shafts() and not shaft_obbs:
         errors_all.append({"code": "E_NO_SHAFTS", "message": "No shafts detected."})
+
+    # --- task: precheck ---
+    if task == TASK_PRECHECK:
+        errors = evaluate_precheck_count_rule(
+            gears=gears,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
+
+        out: Dict[str, Any] = {
+            "summary": {
+                "gears": len(gears),
+                "spacers": len(spacers),
+                "shafts": len(shaft_obbs),
+                "mesh": len(mesh_boxes),
+                "mismesh": len(mismesh_boxes),
+                "stages": 0,
+            },
+            "errors": errors,
+            "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
+            "cold_start": bool(is_cold_start),
+            "task_result": _task_result(
+                TASK_PRECHECK,
+                errors,
+                focus=["precheck"],
+                next_task=TASK_SHAFT,
+            ),
+            "timing": {},
+        }
+        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+        out["timing"] = timing
+        return out
 
     # --- task: gear_inventory ---
     if task == TASK_GEAR_INV:

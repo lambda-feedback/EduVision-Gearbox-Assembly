@@ -32,20 +32,17 @@ TARGET_STAGE_COUNT = int(os.environ.get("LF_TARGET_STAGE_COUNT", "6"))
 
 # ----------------------------
 # Student-facing message policy
-# Edit only this block to change final messages.
 # ----------------------------
 MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     "precheck": {
         "pass": "Good photo. You can proceed.",
-        "photo_fail": "Please retake the photo. Make sure the image is sharp, well lit, and the full gearbox is clearly visible.",
-        "sanity_fail": "Please retake the photo. Some parts or gear contacts could not be checked reliably.",
-        "photo_and_sanity_fail": "Please retake the photo. The image quality is not good enough, and some parts or gear contacts could not be checked reliably.",
+        "fail": "Please retake the photo. The image is not suitable for reliable checking.",
     },
     "shaft": {
         "pass": "Good. The shaft setup looks correct.",
         "count_fail": "A shaft may be missing or not detected. Please check whether both shafts are installed and retake the photo if needed.",
         "type_confusion": "The shaft types could not be identified reliably. Please retake the photo from a clearer angle and make sure both shafts are fully visible.",
-        "position_swap": "The shaft positions appear to be incorrect. Please make sure the short shaft is closer to gear 1 and the long shaft is farther away.",
+        "position_swap": "The shaft positions appear to be incorrect. Please make sure the short shaft is closer to the white gear and the long shaft is farther away.",
         "fail": "Please check the shaft setup again.",
     },
     "spacer": {
@@ -82,7 +79,6 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
 
 
 def _pget(params: Params, key: str, default: Any) -> Any:
-    """Params in lf_toolkit is dict-like; keep safe across versions."""
     try:
         return params.get(key, default)  # type: ignore
     except Exception:
@@ -101,12 +97,6 @@ def file_url_to_local_path(url: str) -> str:
 
 
 def _load_bgr_image_from_url(url: str, timeout: int = 15) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    Load image into OpenCV BGR ndarray from:
-      - http(s) URL
-      - file:// URL
-    Returns (img_bgr, err_message).
-    """
     try:
         if not isinstance(url, str) or not url:
             return None, "Empty URL."
@@ -140,9 +130,6 @@ def _truncate_text(s: str, max_chars: int) -> str:
 
 
 def _result_minimal(is_correct: bool, message: str, *, max_chars: int = _MAX_FEEDBACK_CHARS) -> Result:
-    """
-    Return Result in a version-tolerant minimal way.
-    """
     msg = _truncate_text(message, max_chars=max_chars)
 
     key = "OK" if is_correct else "FAIL"
@@ -160,46 +147,7 @@ def _result_minimal(is_correct: bool, message: str, *, max_chars: int = _MAX_FEE
             return Result(is_correct=is_correct)
 
 
-# ----------------------------
-# Internal image quality checks
-# ----------------------------
-def _image_quality_checks(img_bgr: np.ndarray) -> List[str]:
-    lines: List[str] = []
-    h, w = img_bgr.shape[:2]
-
-    min_w, min_h = 900, 700
-    if w < min_w or h < min_h:
-        lines.append("W_RES_LOW")
-    else:
-        lines.append("OK_RES")
-
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    if blur_score < 80.0:
-        lines.append("W_BLUR")
-    else:
-        lines.append("OK_SHARP")
-
-    mean_intensity = float(gray.mean())
-    if mean_intensity < 60.0:
-        lines.append("W_DARK")
-    elif mean_intensity > 200.0:
-        lines.append("W_GLARE")
-    else:
-        lines.append("OK_EXPOSURE")
-
-    return lines
-
-
-def _has_photo_quality_fail(img_bgr: np.ndarray) -> bool:
-    checks = _image_quality_checks(img_bgr)
-    return any(s.startswith(("W_RES_LOW", "W_BLUR", "W_DARK", "W_GLARE")) for s in checks)
-
-
 def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict[str, Any]]:
-    """
-    Filter pipeline-produced errors for each step.
-    """
     task = (task or "full").strip().lower()
 
     if task == "full":
@@ -210,11 +158,7 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
 
         if task == "precheck":
             return code in {
-                "E_NO_GEARS",
-                "E_CONTACT_COUNT_MISMATCH",
-                "E_GEAR_COUNT_UNSUPPORTED",
-                "E_NO_SHAFTS",
-                "E_NO_GEAR11",
+                "E_PRECHECK_COUNT_RULE_FAIL",
             }
 
         if task == "shaft":
@@ -282,9 +226,6 @@ def _build_student_message(
     errors: List[Dict[str, Any]],
     selected_errors: List[Dict[str, Any]],
 ) -> Tuple[bool, str]:
-    """
-    Centralised student-facing message builder.
-    """
     task = (task or "full").strip().lower()
 
     if task == "full":
@@ -294,16 +235,14 @@ def _build_student_message(
         task = "mesh_ratio"
 
     if task == "precheck":
-        photo_fail = _has_photo_quality_fail(img_bgr)
-        sanity_fail = len(selected_errors) > 0
-
-        if not photo_fail and not sanity_fail:
-            return True, MESSAGE_POLICY["precheck"]["pass"]
-        if photo_fail and sanity_fail:
-            return False, MESSAGE_POLICY["precheck"]["photo_and_sanity_fail"]
-        if photo_fail:
-            return False, MESSAGE_POLICY["precheck"]["photo_fail"]
-        return False, MESSAGE_POLICY["precheck"]["sanity_fail"]
+        has_fail = any(
+            str(e.get("code", "")).upper() == "E_PRECHECK_COUNT_RULE_FAIL"
+            for e in selected_errors
+            if isinstance(e, dict)
+        )
+        if has_fail:
+            return False, MESSAGE_POLICY["precheck"]["fail"]
+        return True, MESSAGE_POLICY["precheck"]["pass"]
 
     is_correct = not _has_pipeline_error(errors)
 
@@ -369,6 +308,25 @@ def _build_student_message(
 
         return True, MESSAGE_POLICY["spacer"]["pass"]
 
+    if task == "gear_inventory":
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
+
+        if (
+            "E_NO_GEARS" in codes
+            or "E_GEAR_COUNT_MISMATCH" in codes
+            or "E_GEAR_COUNT_UNSUPPORTED" in codes
+        ):
+            return False, MESSAGE_POLICY["gear_inventory"]["fail"]
+
+        if not is_correct:
+            return False, MESSAGE_POLICY["gear_inventory"]["fail"]
+
+        return True, MESSAGE_POLICY["gear_inventory"]["pass"]
+
     if task == "mesh_ratio":
         if not is_correct:
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
@@ -410,10 +368,6 @@ def _build_student_message(
 
 
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
-    """
-    Platform entry:
-      response = [{"url": "...", ...}, ...]
-    """
     task = str(_pget(params, "task", "full") or "full").strip().lower()
 
     if task == "full":
@@ -441,11 +395,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         return _result_minimal(False, "The image could not be loaded. Please upload the image again.")
 
     if run_yolo_pipeline is None:
-        if pipeline_task == "precheck":
-            if _has_photo_quality_fail(img_bgr):
-                return _result_minimal(False, MESSAGE_POLICY["precheck"]["photo_fail"])
-            return _result_minimal(False, MESSAGE_POLICY["precheck"]["sanity_fail"])
-
         return _result_minimal(
             False,
             "The system is temporarily unavailable. Please try again later.",
