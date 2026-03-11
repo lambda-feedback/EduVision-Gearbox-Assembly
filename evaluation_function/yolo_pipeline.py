@@ -1,7 +1,7 @@
 """
 YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
 
-Final streamlined version:
+Updated version:
 - Keeps core detection and task logic
 - Removes overlay image generation and drawing utilities
 - Adds parts inventory logic:
@@ -11,9 +11,14 @@ Final streamlined version:
        - shaft: shaft_long / shaft_short
        - spacer: spacer_long / spacer_short
     3) excludes white driving gear from parts inventory gear counts
-- Adds precheck logic:
-    1) checks only the consistency rule between gear count and (mesh + mismesh) count
-    2) does not separately decide whether gears or contacts are wrong
+- Adds precheck consistency logic:
+    1) checks the consistency rule between gear count and (mesh + mismesh) count
+    2) checks the consistency rule between big gear count and small gear count
+    3) treats these as detection consistency checks, not assembly checks
+- Adds gear inventory logic:
+    1) outputs driving_gear / smallgear / biggear counts
+    2) checks whether mismesh exists
+    3) does not use big/small count consistency as a gear-step failure
 - Adds single-stage logic:
     1) expects 1 driving gear
     2) expects 1 short spacer
@@ -241,6 +246,16 @@ def dist_point_to_segment(p: Tuple[float, float], a: Tuple[float, float], b: Tup
     return float((dx * dx + dy * dy) ** 0.5)
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+
 # =========================
 # Gear ratio helpers
 # =========================
@@ -324,15 +339,41 @@ def expected_contact_boxes_from_gear_count(gear_count: int) -> Tuple[Optional[in
     return (gear_count - 1) // 2, True
 
 
-def evaluate_precheck_count_rule(
+# =========================
+# Count helpers
+# =========================
+def get_gear_counts(gears: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {
+        "driving_gear": 0,
+        "smallgear": 0,
+        "biggear": 0,
+    }
+
+    for g in gears:
+        cls = str(g.get("cls", ""))
+        if cls in DRIVING_GEAR_CLASS_NAMES:
+            counts["driving_gear"] += 1
+        elif cls == GEAR_SMALL_NAME:
+            counts["smallgear"] += 1
+        elif cls == GEAR_BIG_NAME:
+            counts["biggear"] += 1
+
+    return counts
+
+
+# =========================
+# Precheck helpers
+# =========================
+def evaluate_precheck_consistency(
     gears: List[Dict[str, Any]],
     mesh_boxes: List[Tuple[float, float, float, float]],
     mismesh_boxes: List[Tuple[float, float, float, float]],
-) -> List[Dict[str, str]]:
+) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
     errs: List[Dict[str, str]] = []
 
-    gear_count = len(gears)
+    counts = get_gear_counts(gears)
     total_contact = len(mesh_boxes) + len(mismesh_boxes)
+    gear_count = len(gears)
 
     expected_contact, ok = expected_contact_boxes_from_gear_count(gear_count)
 
@@ -344,9 +385,7 @@ def evaluate_precheck_count_rule(
                 f"the expected contact rule."
             ),
         })
-        return errs
-
-    if total_contact != expected_contact:
+    elif total_contact != expected_contact:
         errs.append({
             "code": "E_PRECHECK_COUNT_RULE_FAIL",
             "message": (
@@ -355,7 +394,16 @@ def evaluate_precheck_count_rule(
             ),
         })
 
-    return errs
+    if counts["biggear"] != counts["smallgear"]:
+        errs.append({
+            "code": "E_PRECHECK_BIG_SMALL_INCONSISTENT",
+            "message": (
+                f"Precheck failed: biggear={counts['biggear']} and smallgear={counts['smallgear']} "
+                f"are not consistent."
+            ),
+        })
+
+    return errs, counts
 
 
 # =========================
@@ -462,6 +510,32 @@ def evaluate_parts_inventory(
             "message": f"Unsupported part_type: {part_type}",
         }],
     }
+
+
+# =========================
+# Gear inventory helpers
+# =========================
+def evaluate_gear_inventory_step(
+    gears: List[Dict[str, Any]],
+    mismesh_boxes: List[Tuple[float, float, float, float]],
+) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    errs: List[Dict[str, str]] = []
+    counts = get_gear_counts(gears)
+
+    if len(gears) == 0:
+        errs.append({
+            "code": "E_NO_GEARS",
+            "message": "No gears detected.",
+        })
+        return errs, counts
+
+    if len(mismesh_boxes) > 0:
+        errs.append({
+            "code": "E_MESH_MISMATCH",
+            "message": f"Gear inventory check failed: mismesh detected (count={len(mismesh_boxes)}).",
+        })
+
+    return errs, counts
 
 
 # =========================
@@ -1508,7 +1582,7 @@ def run_yolo_pipeline(
 
     # --- task: precheck ---
     if task == TASK_PRECHECK:
-        errors = evaluate_precheck_count_rule(
+        errors, counts = evaluate_precheck_consistency(
             gears=gears,
             mesh_boxes=mesh_boxes,
             mismesh_boxes=mismesh_boxes,
@@ -1523,6 +1597,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
+            "counts": counts,
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1550,6 +1625,7 @@ def run_yolo_pipeline(
                     "mismesh": len(mismesh_boxes),
                     "stages": 0,
                 },
+                "counts": get_gear_counts(gears),
                 "errors": [{"code": "E_NO_GEARS", "message": "No gears detected."}],
                 "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
                 "cold_start": bool(is_cold_start),
@@ -1613,6 +1689,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": num_stages,
             },
+            "counts": get_gear_counts(gears),
             "gear_names": gear_names,
             "gear_stage": gear_stage,
             "chain_pairs": chain_pairs,
@@ -1633,28 +1710,10 @@ def run_yolo_pipeline(
 
     # --- task: gear_inventory ---
     if task == TASK_GEAR_INV:
-        big_cnt = 0
-        small_cnt = 0
-        if gears:
-            med = compute_median_radius(gears)
-            for g in gears:
-                if is_big(g, med):
-                    big_cnt += 1
-                else:
-                    small_cnt += 1
-
-        if expected_gears is not None and gears:
-            try:
-                exp = int(expected_gears)
-                if len(gears) != exp:
-                    errors_all.append({
-                        "code": "E_GEAR_COUNT_MISMATCH",
-                        "message": f"Gear inventory: detected {len(gears)}, expected {exp}."
-                    })
-            except Exception:
-                pass
-
-        errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_GEAR_COUNT", "E_GEAR"))
+        errors, counts = evaluate_gear_inventory_step(
+            gears=gears,
+            mismesh_boxes=mismesh_boxes,
+        )
 
         out: Dict[str, Any] = {
             "summary": {
@@ -1664,9 +1723,8 @@ def run_yolo_pipeline(
                 "mesh": len(mesh_boxes),
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
-                "gear_big": big_cnt,
-                "gear_small": small_cnt,
             },
+            "counts": counts,
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1713,6 +1771,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
+            "counts": get_gear_counts(gears),
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1761,6 +1820,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
+            "counts": get_gear_counts(gears),
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1787,6 +1847,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
+            "counts": get_gear_counts(gears),
             "errors": [{"code": "E_NO_GEARS", "message": "No gears detected."}],
             "gear_names": {},
             "gear_stage": {},
@@ -1849,6 +1910,7 @@ def run_yolo_pipeline(
             "mismesh": len(mismesh_boxes),
             "stages": num_stages,
         },
+        "counts": get_gear_counts(gears),
         "detections": {
             "gear_dets": gear_dets,
             "shaft_obbs": shaft_obbs,

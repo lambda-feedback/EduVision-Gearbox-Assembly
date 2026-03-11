@@ -36,8 +36,16 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "fail": "Some parts could not be detected clearly. Please separate the parts and retake the photo.",
     },
     "precheck": {
-        "pass": "Good photo. You can proceed.",
-        "fail": "Please retake the photo. The image is not suitable for reliable checking.",
+        "pass": "Good. The detected setup is consistent. You can proceed.",
+        "count_rule_fail": (
+            "The detected numbers of gears and gear-contact regions are not consistent. "
+            "Please make sure all gears and contact regions are clearly visible, then retake the photo."
+        ),
+        "big_small_inconsistent": (
+            "The detected numbers of big gears and small gears are not consistent. "
+            "Please make sure all gears are clearly visible, then retake the photo."
+        ),
+        "fail": "Please retake the photo. The detected setup is not consistent enough for reliable checking.",
     },
     "single_stage": {
         "pass": (
@@ -66,8 +74,34 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "fail": "Please check the spacer setup again.",
     },
     "gear_inventory": {
-        "pass": "Good. The gear count looks correct.",
-        "fail": "Please check the gears again. The number or type of detected gears does not match the expected assembly.",
+        "pass": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "Good. No obvious gear mismatch was detected."
+        ),
+        "mismatch_fail": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "A gear mismatch was detected. Please adjust the gear positions so that the gears mesh correctly."
+        ),
+        "no_gears": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "No gears were detected clearly. Please retake the photo."
+        ),
+        "fail": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "Please check the gears again."
+        ),
     },
     "mesh_ratio": {
         "fail": "Please check the gear meshing again. The detected gear contacts do not match the expected setup.",
@@ -176,13 +210,15 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
         if task == "precheck":
             return code in {
                 "E_PRECHECK_COUNT_RULE_FAIL",
+                "E_PRECHECK_BIG_SMALL_INCONSISTENT",
+                "E_NO_GEARS",
             }
 
         if task == "single_stage":
             return code.startswith("E_SINGLE_STAGE") or code == "E_NO_GEARS"
 
         if task == "shaft":
-            return code.startswith("E_SHAFT") or code == "E_NO_SHAFTS" or code == "E_NO_GEAR11"
+            return code.startswith("E_SHAFT") or code == "E_NO_SHAFTS" or code == "E_NO_GEAR11" or code == "E_NO_GEARS"
 
         if task == "spacer":
             return (
@@ -193,7 +229,10 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
             )
 
         if task == "gear_inventory":
-            return code in {"E_NO_GEARS", "E_GEAR_COUNT_MISMATCH", "E_GEAR_COUNT_UNSUPPORTED"}
+            return code in {
+                "E_NO_GEARS",
+                "E_MESH_MISMATCH",
+            }
 
         if task == "mesh_ratio":
             return (
@@ -214,6 +253,13 @@ def _has_pipeline_error(errors: List[Dict[str, Any]]) -> bool:
     return any(
         isinstance(e, dict) and str(e.get("code", "")).startswith("E_")
         for e in errors
+    )
+
+
+def _has_selected_pipeline_error(selected_errors: List[Dict[str, Any]]) -> bool:
+    return any(
+        isinstance(e, dict) and str(e.get("code", "")).startswith("E_")
+        for e in selected_errors
     )
 
 
@@ -238,8 +284,34 @@ def _format_rpm_value(out_rpm: Any) -> str:
         return str(out_rpm)
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+
+def _get_counts_dict(out: Dict[str, Any]) -> Dict[str, Any]:
+    return out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
+
+
+def _get_gear_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
+    counts = _get_counts_dict(out)
+
+    driving_gear = _safe_int(
+        counts.get("driving_gear", counts.get("drivinggear", counts.get("gear11", 0)))
+    )
+    smallgear = _safe_int(counts.get("smallgear", 0))
+    biggear = _safe_int(counts.get("biggear", 0))
+
+    return driving_gear, smallgear, biggear
+
+
 def _build_parts_inventory_message(out: Dict[str, Any], part_type: str) -> Tuple[bool, str]:
-    counts = out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
+    counts = _get_counts_dict(out)
     errors = out.get("errors", []) if isinstance(out.get("errors"), list) else []
 
     is_correct = len(errors) == 0
@@ -298,14 +370,27 @@ def _build_student_message(
     if task not in ("precheck", "single_stage", "shaft", "spacer", "gear_inventory", "mesh_ratio"):
         task = "mesh_ratio"
 
+    task_has_error = _has_selected_pipeline_error(selected_errors)
+
     if task == "precheck":
-        has_fail = any(
-            str(e.get("code", "")).upper() == "E_PRECHECK_COUNT_RULE_FAIL"
+        codes = {
+            str(e.get("code", "")).upper()
             for e in selected_errors
             if isinstance(e, dict)
-        )
-        if has_fail:
+        }
+
+        if "E_NO_GEARS" in codes:
             return False, MESSAGE_POLICY["precheck"]["fail"]
+
+        if "E_PRECHECK_BIG_SMALL_INCONSISTENT" in codes:
+            return False, MESSAGE_POLICY["precheck"]["big_small_inconsistent"]
+
+        if "E_PRECHECK_COUNT_RULE_FAIL" in codes:
+            return False, MESSAGE_POLICY["precheck"]["count_rule_fail"]
+
+        if task_has_error:
+            return False, MESSAGE_POLICY["precheck"]["fail"]
+
         return True, MESSAGE_POLICY["precheck"]["pass"]
 
     if task == "single_stage":
@@ -326,8 +411,6 @@ def _build_student_message(
             R_total=_format_ratio_value(r_total),
             out_rpm=_format_rpm_value(out_rpm),
         )
-
-    is_correct = not _has_pipeline_error(errors)
 
     if task == "shaft":
         codes = {
@@ -352,7 +435,7 @@ def _build_student_message(
         if "E_SHAFT_POSITION_SWAP" in codes:
             return False, MESSAGE_POLICY["shaft"]["position_swap"]
 
-        if not is_correct:
+        if task_has_error:
             return False, MESSAGE_POLICY["shaft"]["fail"]
 
         return True, MESSAGE_POLICY["shaft"]["pass"]
@@ -386,7 +469,7 @@ def _build_student_message(
         if "E_SPACER_DISTANCE_ORDER" in codes:
             return False, MESSAGE_POLICY["spacer"]["distance_order"]
 
-        if not is_correct:
+        if task_has_error:
             return False, MESSAGE_POLICY["spacer"]["fail"]
 
         return True, MESSAGE_POLICY["spacer"]["pass"]
@@ -398,19 +481,37 @@ def _build_student_message(
             if isinstance(e, dict)
         }
 
-        if (
-            "E_NO_GEARS" in codes
-            or "E_GEAR_COUNT_MISMATCH" in codes
-            or "E_GEAR_COUNT_UNSUPPORTED" in codes
-        ):
-            return False, MESSAGE_POLICY["gear_inventory"]["fail"]
+        driving_gear, smallgear, biggear = _get_gear_counts(out)
 
-        if not is_correct:
-            return False, MESSAGE_POLICY["gear_inventory"]["fail"]
+        if "E_NO_GEARS" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["no_gears"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
 
-        return True, MESSAGE_POLICY["gear_inventory"]["pass"]
+        if "E_MESH_MISMATCH" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["mismatch_fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if task_has_error:
+            return False, MESSAGE_POLICY["gear_inventory"]["fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        return True, MESSAGE_POLICY["gear_inventory"]["pass"].format(
+            driving_gear=driving_gear,
+            smallgear=smallgear,
+            biggear=biggear,
+        )
 
     if task == "mesh_ratio":
+        is_correct = not _has_pipeline_error(errors)
         if not is_correct:
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
 
@@ -460,7 +561,9 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         pipeline_task = task
         message_task = task
 
-    return_images: bool = bool(_pget(params, "return_images", pipeline_task not in ("precheck", "parts_inventory", "single_stage")))
+    return_images: bool = bool(
+        _pget(params, "return_images", pipeline_task not in ("precheck", "parts_inventory", "single_stage"))
+    )
     gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
     shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
     expected_gears = _pget(params, "expected_gears", None)
