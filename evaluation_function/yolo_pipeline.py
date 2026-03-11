@@ -1,43 +1,3 @@
-"""
-YOLO inference pipeline (gear model + shaft OBB model) — TASK-AWARE VERSION
-
-Updated version:
-- Keeps core detection and task logic
-- Removes overlay image generation and drawing utilities
-- Adds parts inventory logic:
-    1) supports part_type = gear / shaft / spacer
-    2) outputs counts only for:
-       - gear: biggear / smallgear
-       - shaft: shaft_long / shaft_short
-       - spacer: spacer_long / spacer_short
-    3) excludes white driving gear from parts inventory gear counts
-- Adds precheck consistency logic:
-    1) checks the consistency rule between gear count and (mesh + mismesh) count
-    2) checks the consistency rule between big gear count and small gear count
-    3) treats these as detection consistency checks, not assembly checks
-- Adds gear inventory logic:
-    1) outputs driving_gear / smallgear / biggear counts
-    2) checks whether mismesh exists
-    3) does not use big/small count consistency as a gear-step failure
-- Adds single-stage logic:
-    1) expects 1 driving gear
-    2) expects 1 short spacer
-    3) expects 1 small gear and 1 big gear
-    4) expects 1 shaft (long or short)
-    5) expects no mismesh
-    6) expects exactly 1 stage and a valid ratio
-- Adds improved shaft-step logic:
-    1) missing shaft / wrong shaft count
-    2) two shafts of the same detected type
-    3) shaft_short / shaft_long position swap relative to gear11
-- Adds improved spacer-step logic:
-    1) missing spacer / wrong spacer count
-    2) missing short spacer / missing long spacer
-    3) two spacers of the same detected type
-    4) spacer position mismatch relative to expected shafts
-    5) spacer distance order mismatch relative to gear11
-"""
-
 from __future__ import annotations
 
 import math
@@ -77,9 +37,12 @@ MESH_CLASS_NAME = "Mesh"
 MISMESH_CLASS_NAME = "Mismesh"
 
 SPACER_CLASSES = {
-    "spacer_long", "spacer_short",
-    "Long spacer tube", "Short spacer tube",
-    "spacer tube long", "spacer tube short"
+    "spacer_long",
+    "spacer_short",
+    "Long spacer tube",
+    "Short spacer tube",
+    "spacer tube long",
+    "spacer tube short",
 }
 TARGET_SHAFT_CLASSES = {"shaft_long", "shaft_short"}
 
@@ -104,7 +67,12 @@ NORM_DMS: float = 200.0
 NORM_GAP: float = 200.0
 
 ENABLE_ERROR_CHECKS: bool = True
-SPACER_DIST_TOL_PX: float = 5.0
+
+# Geometry / ambiguity thresholds
+SHAFT_DISTANCE_AMBIG_RATIO: float = 0.08
+SPACER_ASSIGN_AXIS_DIST_RATIO: float = 0.90
+SPACER_ASSIGN_CENTER_DIST_RATIO: float = 0.90
+SPACER_DIST_TOL_RATIO: float = 0.12
 
 
 # -------------------------
@@ -232,7 +200,11 @@ def center_dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return float((dx * dx + dy * dy) ** 0.5)
 
 
-def dist_point_to_segment(p: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+def dist_point_to_segment(
+    p: Tuple[float, float],
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> float:
     px, py = p
     ax, ay = a
     bx, by = b
@@ -254,6 +226,52 @@ def _safe_int(x: Any, default: int = 0) -> int:
             return int(float(x))
         except Exception:
             return default
+
+
+def shaft_length_width_from_poly(pts4: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    pts = np.asarray(pts4, dtype=np.float32)
+    e01 = pts[1] - pts[0]
+    e12 = pts[2] - pts[1]
+    len01 = float(np.linalg.norm(e01))
+    len12 = float(np.linalg.norm(e12))
+
+    if len01 >= len12:
+        major = len01
+        minor = len12
+        axis = e01 / (len01 + 1e-9)
+    else:
+        major = len12
+        minor = len01
+        axis = e12 / (len12 + 1e-9)
+
+    return major, minor, axis.astype(np.float32)
+
+
+def dist_point_to_shaft_axis(pt: Tuple[float, float], shaft: Dict[str, Any]) -> float:
+    c = shaft["center"]
+    major = float(shaft.get("major_len", 0.0))
+    axis = shaft["axis_dir"]
+
+    half = 0.5 * major
+    p1 = (float(c[0] - axis[0] * half), float(c[1] - axis[1] * half))
+    p2 = (float(c[0] + axis[0] * half), float(c[1] + axis[1] * half))
+    return dist_point_to_segment(pt, p1, p2)
+
+
+def relative_spacer_distance_tol(shafts: List[Dict[str, Any]], gears: List[Dict[str, Any]]) -> float:
+    shaft_lengths = [float(s.get("major_len", 0.0)) for s in shafts if float(s.get("major_len", 0.0)) > 1e-6]
+    gear_rs = [float(g.get("r", 0.0)) for g in gears if float(g.get("r", 0.0)) > 1e-6]
+
+    ref = 0.0
+    if shaft_lengths:
+        ref = max(ref, float(np.median(np.array(shaft_lengths, dtype=np.float32))))
+    if gear_rs:
+        ref = max(ref, 2.0 * float(np.median(np.array(gear_rs, dtype=np.float32))))
+
+    if ref <= 1e-6:
+        ref = 40.0
+
+    return max(5.0, SPACER_DIST_TOL_RATIO * ref)
 
 
 # =========================
@@ -322,12 +340,12 @@ def compute_ratio_and_rpm_from_stage_labels(
 # Spacer helpers
 # =========================
 def spacer_is_long(sp: Dict[str, Any]) -> bool:
-    t = sp["cls"].lower().replace("_", " ")
+    t = str(sp["cls"]).lower().replace("_", " ")
     return ("long" in t) and ("spacer" in t)
 
 
 def spacer_is_short(sp: Dict[str, Any]) -> bool:
-    t = sp["cls"].lower().replace("_", " ")
+    t = str(sp["cls"]).lower().replace("_", " ")
     return ("short" in t) and ("spacer" in t)
 
 
@@ -357,6 +375,37 @@ def get_gear_counts(gears: List[Dict[str, Any]]) -> Dict[str, int]:
             counts["smallgear"] += 1
         elif cls == GEAR_BIG_NAME:
             counts["biggear"] += 1
+
+    return counts
+
+
+def get_shaft_counts(shafts: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {
+        "shaft_long": 0,
+        "shaft_short": 0,
+    }
+
+    for s in shafts:
+        cls = str(s.get("cls", ""))
+        if cls == "shaft_long":
+            counts["shaft_long"] += 1
+        elif cls == "shaft_short":
+            counts["shaft_short"] += 1
+
+    return counts
+
+
+def get_spacer_counts(spacers: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {
+        "spacer_long": 0,
+        "spacer_short": 0,
+    }
+
+    for sp in spacers:
+        if spacer_is_long(sp):
+            counts["spacer_long"] += 1
+        elif spacer_is_short(sp):
+            counts["spacer_short"] += 1
 
     return counts
 
@@ -415,18 +464,6 @@ def evaluate_parts_inventory(
     gear_dets: List[Dict[str, Any]],
     shaft_dets: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Returns counts only for the requested part type.
-
-    part_type:
-      - "gear"   -> biggear / smallgear
-      - "shaft"  -> shaft_long / shaft_short
-      - "spacer" -> spacer_long / spacer_short
-
-    Notes:
-      - white driving gear is excluded from gear counts
-      - color is ignored
-    """
     errors: List[Dict[str, str]] = []
     counts: Dict[str, int] = {}
     part_type = str(part_type or "").strip().lower()
@@ -450,10 +487,7 @@ def evaluate_parts_inventory(
                 "message": "No target gears were detected.",
             })
 
-        return {
-            "counts": counts,
-            "errors": errors,
-        }
+        return {"counts": counts, "errors": errors}
 
     if part_type == "shaft":
         counts = {
@@ -474,10 +508,7 @@ def evaluate_parts_inventory(
                 "message": "No target shafts were detected.",
             })
 
-        return {
-            "counts": counts,
-            "errors": errors,
-        }
+        return {"counts": counts, "errors": errors}
 
     if part_type == "spacer":
         counts = {
@@ -498,10 +529,7 @@ def evaluate_parts_inventory(
                 "message": "No target spacers were detected.",
             })
 
-        return {
-            "counts": counts,
-            "errors": errors,
-        }
+        return {"counts": counts, "errors": errors}
 
     return {
         "counts": {},
@@ -616,11 +644,6 @@ def get_expected_shaft_indices_for_step(
     shafts: List[Dict[str, Any]],
     gear11_gid: int,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Return:
-      - short_shaft_idx: shaft expected to be closer to gear11
-      - long_shaft_idx: shaft expected to be farther from gear11
-    """
     if not gears or not shafts or len(shafts) < 2:
         return None, None
 
@@ -638,6 +661,13 @@ def get_expected_shaft_indices_for_step(
     if len(dlist) < 2:
         return None, None
 
+    d0 = float(dlist[0][0])
+    d1 = float(dlist[1][0])
+    ref = max(d1, 1.0)
+
+    if abs(d1 - d0) / ref < SHAFT_DISTANCE_AMBIG_RATIO:
+        return None, None
+
     short_shaft_idx = dlist[0][1]
     long_shaft_idx = dlist[1][1]
     return short_shaft_idx, long_shaft_idx
@@ -649,11 +679,6 @@ def pick_shaft2_and_shaft3_by_distance(
     gear_to_si: Dict[int, int],
     gears: List[Dict[str, Any]],
 ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """
-    Legacy helper kept for compatibility with assembly checks.
-    shaft1: shaft containing gear11
-    shaft2/shaft3: by distance to gear11 (closest, 2nd closest), excluding shaft1
-    """
     if not shafts or not gears:
         return None, None, None
 
@@ -681,12 +706,6 @@ def evaluate_shaft_step_errors(
     shafts: List[Dict[str, Any]],
     gear11_gid: int,
 ) -> List[Dict[str, str]]:
-    """
-    Shaft-step specific rules:
-    1) expected exactly two shafts
-    2) expected one shaft_short and one shaft_long
-    3) shaft_short should be closer to gear11 than shaft_long
-    """
     errs: List[Dict[str, str]] = []
 
     if not gears:
@@ -733,8 +752,8 @@ def evaluate_shaft_step_errors(
         })
         return errs
 
-    short_dist = short_shafts[0]["dist"]
-    long_dist = long_shafts[0]["dist"]
+    short_dist = float(short_shafts[0]["dist"])
+    long_dist = float(long_shafts[0]["dist"])
 
     if long_dist < short_dist:
         errs.append({
@@ -774,14 +793,6 @@ def evaluate_spacer_step_errors(
     gear11_gid: int,
     spacer_to_si: Dict[int, int],
 ) -> List[Dict[str, str]]:
-    """
-    Spacer-step specific rules:
-    1) expected exactly two spacers
-    2) expected one spacer_short and one spacer_long
-    3) spacer_short should be on the shaft closer to gear11
-    4) spacer_long should be on the shaft farther from gear11
-    5) spacer_short should be closer to gear11 than spacer_long
-    """
     errs: List[Dict[str, str]] = []
 
     if not gears:
@@ -799,6 +810,7 @@ def evaluate_spacer_step_errors(
 
     c11 = g11["center"]
 
+    # Layer 1: availability / count
     if len(spacers) == 0:
         errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "No spacers detected."})
         return errs
@@ -822,6 +834,7 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
+    # Layer 2: type reliability
     short_spacers = [sp for sp in spacers if spacer_is_short(sp)]
     long_spacers = [sp for sp in spacers if spacer_is_long(sp)]
 
@@ -843,6 +856,7 @@ def evaluate_spacer_step_errors(
     short_sp = short_spacers[0]
     long_sp = long_spacers[0]
 
+    # Layer 3: reference / shaft identity reliability
     short_shaft_idx, long_shaft_idx = get_expected_shaft_indices_for_step(
         gears=gears,
         shafts=shafts,
@@ -851,14 +865,22 @@ def evaluate_spacer_step_errors(
 
     if short_shaft_idx is None or long_shaft_idx is None:
         errs.append({
-            "code": "E_SPACER_POSITION_MISMATCH",
-            "message": "Cannot determine the expected shaft positions for spacers."
+            "code": "E_SPACER_ASSIGNMENT_FAIL",
+            "message": "The expected shaft identities could not be determined reliably."
         })
         return errs
 
     short_sp_si = spacer_to_si.get(short_sp["sid"])
     long_sp_si = spacer_to_si.get(long_sp["sid"])
 
+    if short_sp_si is None or long_sp_si is None:
+        errs.append({
+            "code": "E_SPACER_ASSIGNMENT_FAIL",
+            "message": "The spacer-to-shaft assignment could not be determined reliably."
+        })
+        return errs
+
+    # Layer 4: geometry
     if short_sp_si != short_shaft_idx or long_sp_si != long_shaft_idx:
         errs.append({
             "code": "E_SPACER_POSITION_MISMATCH",
@@ -868,11 +890,12 @@ def evaluate_spacer_step_errors(
 
     d_short = center_dist(short_sp["center"], c11)
     d_long = center_dist(long_sp["center"], c11)
+    tol_px = relative_spacer_distance_tol(shafts, gears)
 
-    if d_short > d_long + float(SPACER_DIST_TOL_PX):
+    if d_short > d_long + tol_px:
         errs.append({
             "code": "E_SPACER_DISTANCE_ORDER",
-            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={SPACER_DIST_TOL_PX}px)."
+            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={tol_px:.1f}px)."
         })
 
     return errs
@@ -945,10 +968,12 @@ def evaluate_assembly_errors(
     if spacer2 is not None and spacer3 is not None:
         d2 = center_dist(spacer2["center"], c11)
         d3 = center_dist(spacer3["center"], c11)
-        if d2 > d3 + float(SPACER_DIST_TOL_PX):
+        tol_px = relative_spacer_distance_tol(shafts, gears)
+
+        if d2 > d3 + tol_px:
             errs.append({
                 "code": "E_SPACER_DISTANCE_ORDER",
-                "message": f"Consistency check: spacer2 is not closer to gear11 than spacer3 (tol={SPACER_DIST_TOL_PX}px)."
+                "message": f"Consistency check: spacer2 is not closer to gear11 than spacer3 (tol={tol_px:.1f}px)."
             })
 
     total_contact = len(mesh_boxes) + len(mismesh_boxes)
@@ -1036,12 +1061,7 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
                 continue
 
             c = poly_center(pts)
-
-            e01 = pts[1] - pts[0]
-            e12 = pts[2] - pts[1]
-            d = e01 if np.linalg.norm(e01) >= np.linalg.norm(e12) else e12
-            n = float(np.linalg.norm(d) + 1e-9)
-            d = (d / n).astype(np.float32)
+            major_len, minor_len, axis_dir = shaft_length_width_from_poly(pts)
 
             dets.append({
                 "cls": cls,
@@ -1049,7 +1069,9 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
                 "poly4": pts,
                 "poly4_scaled": scale_poly_about_center(pts, scale=OBB_ASSIGN_SCALE),
                 "center": c,
-                "axis_dir": d,
+                "axis_dir": axis_dir,
+                "major_len": float(major_len),
+                "minor_len": float(minor_len),
             })
 
     return dets
@@ -1118,6 +1140,7 @@ def assign_items_to_shafts(
     spacer_to_si: Dict[int, int] = {}
     si_to_spacers: Dict[int, List[int]] = {i: [] for i in range(len(shafts))}
 
+    # -------- gears: keep strict assignment --------
     for g in gears:
         c = g["center"]
         candidates = []
@@ -1129,16 +1152,47 @@ def assign_items_to_shafts(
             gear_to_si[g["gid"]] = best
             si_to_gids[best].append(g["gid"])
 
+    # -------- spacers: strict first, relaxed fallback second --------
     for sp in spacers:
         c = sp["center"]
-        candidates = []
+
+        strict_candidates = []
         for i, s in enumerate(shafts):
             if point_in_poly(c, s["poly4_scaled"]):
-                candidates.append(i)
-        if candidates:
-            best = max(candidates, key=lambda i: shafts[i]["score"])
+                strict_candidates.append(i)
+
+        if strict_candidates:
+            best = max(strict_candidates, key=lambda i: shafts[i]["score"])
             spacer_to_si[sp["sid"]] = best
             si_to_spacers[best].append(sp["sid"])
+            continue
+
+        # fallback by shaft-axis distance
+        scored: List[Tuple[float, float, int]] = []
+        for i, s in enumerate(shafts):
+            axis_dist = dist_point_to_shaft_axis(c, s)
+            center_d = center_dist(c, s["center"])
+            scored.append((axis_dist, center_d, i))
+
+        if not scored:
+            continue
+
+        scored.sort(key=lambda x: (x[0], x[1]))
+        best_axis_dist, best_center_d, best_i = scored[0]
+        shaft = shafts[best_i]
+
+        axis_thresh = max(
+            8.0,
+            SPACER_ASSIGN_AXIS_DIST_RATIO * max(float(shaft.get("minor_len", 0.0)), 1.0),
+        )
+        center_thresh = max(
+            15.0,
+            SPACER_ASSIGN_CENTER_DIST_RATIO * max(float(shaft.get("major_len", 0.0)), 1.0),
+        )
+
+        if best_axis_dist <= axis_thresh and best_center_d <= center_thresh:
+            spacer_to_si[sp["sid"]] = best_i
+            si_to_spacers[best_i].append(sp["sid"])
 
     return gear_to_si, si_to_gids, spacer_to_si, si_to_spacers
 
@@ -1515,7 +1569,9 @@ def run_yolo_pipeline(
         gear11_gid = int(driving["gid"])
 
     if gears and shaft_obbs:
-        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
+        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(
+            gears, spacers, shaft_obbs
+        )
 
     errors_all: List[Dict[str, str]] = []
 
@@ -1742,6 +1798,8 @@ def run_yolo_pipeline(
 
     # --- task: shaft ---
     if task == TASK_SHAFT:
+        shaft_counts = get_shaft_counts(shaft_obbs)
+
         if errors_all:
             errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
         else:
@@ -1771,7 +1829,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
-            "counts": get_gear_counts(gears),
+            "counts": shaft_counts,
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1789,6 +1847,8 @@ def run_yolo_pipeline(
 
     # --- task: spacer ---
     if task == TASK_SPACER:
+        spacer_counts = get_spacer_counts(spacers)
+
         if errors_all:
             errors = _filter_errors_by_prefix(errors_all, prefixes=("E_NO_GEARS", "E_NO_SHAFTS"))
         else:
@@ -1820,7 +1880,7 @@ def run_yolo_pipeline(
                 "mismesh": len(mismesh_boxes),
                 "stages": 0,
             },
-            "counts": get_gear_counts(gears),
+            "counts": spacer_counts,
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
@@ -1870,7 +1930,9 @@ def run_yolo_pipeline(
         gear11_gid = pick_driving_gear(gears)["gid"]
 
     if gears and shaft_obbs and not gear_to_si:
-        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(gears, spacers, shaft_obbs)
+        gear_to_si, _si_to_gids, spacer_to_si, _si_to_spacers = assign_items_to_shafts(
+            gears, spacers, shaft_obbs
+        )
 
     errors: List[Dict[str, str]] = []
     if ENABLE_ERROR_CHECKS and shaft_obbs:

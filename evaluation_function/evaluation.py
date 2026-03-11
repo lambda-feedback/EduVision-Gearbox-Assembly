@@ -69,6 +69,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "long_missing": "The long spacer may be missing or not detected. Please check whether the long spacer is installed and retake the photo if needed.",
         "count_fail": "A spacer may be missing or not detected. Please check whether both spacers are installed and retake the photo if needed.",
         "type_confusion": "The spacer types could not be identified reliably. Please retake the photo from a clearer angle and make sure both spacers are fully visible.",
+        "assignment_fail": "The spacers were detected, but their positions could not be determined reliably. Please retake the photo from a clearer top view and make sure both spacers are fully visible.",
         "position_mismatch": "The spacer positions appear to be incorrect. Please make sure the short spacer is on the short shaft and the long spacer is on the long shaft.",
         "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to gear 1 than the long spacer.",
         "fail": "Please check the spacer setup again.",
@@ -191,6 +192,16 @@ def _result_minimal(is_correct: bool, message: str, *, max_chars: int = _MAX_FEE
             return Result(is_correct=is_correct)
 
 
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+
 def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict[str, Any]]:
     task = (task or "full").strip().lower()
 
@@ -218,14 +229,23 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
             return code.startswith("E_SINGLE_STAGE") or code == "E_NO_GEARS"
 
         if task == "shaft":
-            return code.startswith("E_SHAFT") or code == "E_NO_SHAFTS" or code == "E_NO_GEAR11" or code == "E_NO_GEARS"
+            return (
+                code.startswith("E_SHAFT")
+                or code == "E_NO_SHAFTS"
+                or code == "E_NO_GEAR11"
+                or code == "E_NO_GEARS"
+            )
 
         if task == "spacer":
             return (
                 code.startswith("E_SPACER")
+                or code.startswith("E_ASSIGN")
+                or code.startswith("E_PARTS")
+                or code == "E_BAD_PART_TYPE"
+                or code == "E_NO_TARGET_PARTS"
                 or code == "E_NO_SHAFTS"
-                or code == "E_NO_GEARS"
                 or code == "E_NO_GEAR11"
+                or code == "E_NO_GEARS"
             )
 
         if task == "gear_inventory":
@@ -284,16 +304,6 @@ def _format_rpm_value(out_rpm: Any) -> str:
         return str(out_rpm)
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        try:
-            return int(float(x))
-        except Exception:
-            return default
-
-
 def _get_counts_dict(out: Dict[str, Any]) -> Dict[str, Any]:
     return out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
 
@@ -308,6 +318,26 @@ def _get_gear_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
     biggear = _safe_int(counts.get("biggear", 0))
 
     return driving_gear, smallgear, biggear
+
+
+def _get_shaft_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
+    counts = _get_counts_dict(out)
+
+    n_long = _safe_int(counts.get("shaft_long", 0))
+    n_short = _safe_int(counts.get("shaft_short", 0))
+    n_total = n_long + n_short
+
+    return n_long, n_short, n_total
+
+
+def _get_spacer_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
+    counts = _get_counts_dict(out)
+
+    n_long = _safe_int(counts.get("spacer_long", 0))
+    n_short = _safe_int(counts.get("spacer_short", 0))
+    n_total = n_long + n_short
+
+    return n_long, n_short, n_total
 
 
 def _build_parts_inventory_message(out: Dict[str, Any], part_type: str) -> Tuple[bool, str]:
@@ -419,6 +449,16 @@ def _build_student_message(
             if isinstance(e, dict)
         }
 
+        n_long, n_short, n_total = _get_shaft_counts(out)
+
+        # ---- hard fallback by counts first ----
+        if n_total > 0:
+            if n_total != 2:
+                return False, MESSAGE_POLICY["shaft"]["count_fail"]
+
+            if n_short != 1 or n_long != 1:
+                return False, MESSAGE_POLICY["shaft"]["type_confusion"]
+
         if (
             "E_SHAFT_COUNT_MISMATCH" in codes
             or "E_NO_SHAFTS" in codes
@@ -438,6 +478,7 @@ def _build_student_message(
         if task_has_error:
             return False, MESSAGE_POLICY["shaft"]["fail"]
 
+        # If no shaft counts are available, still allow pass only when pipeline reports no error.
         return True, MESSAGE_POLICY["shaft"]["pass"]
 
     if task == "spacer":
@@ -447,6 +488,24 @@ def _build_student_message(
             if isinstance(e, dict)
         }
 
+        n_long, n_short, n_total = _get_spacer_counts(out)
+
+        # ---- Layer 1: hard fallback by counts first ----
+        # Only activate when spacer counts are actually provided by the pipeline.
+        if ("spacer_long" in _get_counts_dict(out)) or ("spacer_short" in _get_counts_dict(out)):
+            if n_total == 0:
+                return False, MESSAGE_POLICY["spacer"]["count_fail"]
+
+            if n_short == 0 and n_long >= 1:
+                return False, MESSAGE_POLICY["spacer"]["short_missing"]
+
+            if n_long == 0 and n_short >= 1:
+                return False, MESSAGE_POLICY["spacer"]["long_missing"]
+
+            if n_short != 1 or n_long != 1 or n_total != 2:
+                return False, MESSAGE_POLICY["spacer"]["count_fail"]
+
+        # ---- Layer 2: explicit pipeline error codes ----
         if "E_SPACER_SHORT_MISSING" in codes:
             return False, MESSAGE_POLICY["spacer"]["short_missing"]
 
@@ -459,6 +518,15 @@ def _build_student_message(
         if "E_SPACER_TYPE_CONFUSION" in codes:
             return False, MESSAGE_POLICY["spacer"]["type_confusion"]
 
+        # Assignment / visibility ambiguity should not be mapped to position mismatch.
+        if (
+            "E_SPACER_ASSIGNMENT_FAIL" in codes
+            or "E_SPACER2_MISSING" in codes
+            or "E_SPACER3_MISSING" in codes
+        ):
+            return False, MESSAGE_POLICY["spacer"]["assignment_fail"]
+
+        # True geometric mismatch after assignment succeeded.
         if (
             "E_SPACER_POSITION_MISMATCH" in codes
             or "E_SPACER2_TYPE_MISMATCH" in codes
