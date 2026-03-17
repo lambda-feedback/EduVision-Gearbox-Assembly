@@ -23,8 +23,9 @@ else:
 # =========================
 # CONFIG
 # =========================
-CONF_GEAR: float = 0.50
-CONF_SHAFT: float = 0.50
+CONF_MODEL_A: float = 0.50
+CONF_MODEL_B: float = 0.50
+CONF_MODEL_C: float = 0.50
 
 MOTOR_RPM: float = 8000.0
 TEETH_BIG: int = 48
@@ -103,8 +104,14 @@ _VALID_TASKS = {
 # Paths
 # =========================
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_GEAR_MODEL_REL = "gear_model.pt"
-DEFAULT_SHAFT_MODEL_REL = "shaft_model.pt"
+
+DEFAULT_MODEL_A_REL = "modelA.pt"
+DEFAULT_MODEL_B_REL = "modelB.pt"
+DEFAULT_MODEL_C_REL = "modelC.pt"
+
+# Backward-compatible aliases
+DEFAULT_GEAR_MODEL_REL = DEFAULT_MODEL_A_REL
+DEFAULT_SHAFT_MODEL_REL = DEFAULT_MODEL_B_REL
 
 
 def _abs_model_path(rel_name: str) -> str:
@@ -114,7 +121,7 @@ def _abs_model_path(rel_name: str) -> str:
 # =========================
 # Model cache
 # =========================
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _load_yolo_model(abs_path: str) -> Any:
     if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Model not found: {abs_path}")
@@ -124,22 +131,26 @@ def _load_yolo_model(abs_path: str) -> Any:
 
 
 def get_models(
-    gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
-    shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
+    model_a_rel: str = DEFAULT_MODEL_A_REL,
+    model_b_rel: str = DEFAULT_MODEL_B_REL,
+    model_c_rel: str = DEFAULT_MODEL_C_REL,
     timing: Optional[Dict[str, float]] = None,
-) -> Tuple[Any, Any]:
+) -> Tuple[Any, Any, Any]:
     t0 = time.perf_counter()
-    gear_model = _load_yolo_model(_abs_model_path(gear_model_rel))
+    model_a = _load_yolo_model(_abs_model_path(model_a_rel))
     t1 = time.perf_counter()
-    shaft_model = _load_yolo_model(_abs_model_path(shaft_model_rel))
+    model_b = _load_yolo_model(_abs_model_path(model_b_rel))
     t2 = time.perf_counter()
+    model_c = _load_yolo_model(_abs_model_path(model_c_rel))
+    t3 = time.perf_counter()
 
     if timing is not None:
-        timing["t_load_gear_model_s"] = float(t1 - t0)
-        timing["t_load_shaft_model_s"] = float(t2 - t1)
-        timing["t_get_models_total_s"] = float(t2 - t0)
+        timing["t_load_model_a_s"] = float(t1 - t0)
+        timing["t_load_model_b_s"] = float(t2 - t1)
+        timing["t_load_model_c_s"] = float(t3 - t2)
+        timing["t_get_models_total_s"] = float(t3 - t0)
 
-    return gear_model, shaft_model
+    return model_a, model_b, model_c
 
 
 # =========================
@@ -463,6 +474,7 @@ def evaluate_parts_inventory(
     part_type: str,
     gear_dets: List[Dict[str, Any]],
     shaft_dets: List[Dict[str, Any]],
+    aux_dets: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     errors: List[Dict[str, str]] = []
     counts: Dict[str, int] = {}
@@ -472,6 +484,7 @@ def evaluate_parts_inventory(
         counts = {
             "biggear": 0,
             "smallgear": 0,
+            "driving_gear": 0,
         }
 
         for d in gear_dets:
@@ -480,8 +493,10 @@ def evaluate_parts_inventory(
                 counts["biggear"] += 1
             elif cls == GEAR_SMALL_NAME:
                 counts["smallgear"] += 1
+            elif cls in DRIVING_GEAR_CLASS_NAMES:
+                counts["driving_gear"] += 1
 
-        if (counts["biggear"] + counts["smallgear"]) == 0:
+        if (counts["biggear"] + counts["smallgear"] + counts["driving_gear"]) == 0:
             errors.append({
                 "code": "E_NO_TARGET_PARTS",
                 "message": "No target gears were detected.",
@@ -516,7 +531,7 @@ def evaluate_parts_inventory(
             "spacer_short": 0,
         }
 
-        for d in gear_dets:
+        for d in aux_dets:
             cls = str(d.get("cls", "")).lower().replace(" ", "_")
             if ("spacer" in cls) and ("long" in cls):
                 counts["spacer_long"] += 1
@@ -810,7 +825,6 @@ def evaluate_spacer_step_errors(
 
     c11 = g11["center"]
 
-    # Layer 1: availability / count
     if len(spacers) == 0:
         errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "No spacers detected."})
         return errs
@@ -834,7 +848,6 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
-    # Layer 2: type reliability
     short_spacers = [sp for sp in spacers if spacer_is_short(sp)]
     long_spacers = [sp for sp in spacers if spacer_is_long(sp)]
 
@@ -856,7 +869,6 @@ def evaluate_spacer_step_errors(
     short_sp = short_spacers[0]
     long_sp = long_spacers[0]
 
-    # Layer 3: reference / shaft identity reliability
     short_shaft_idx, long_shaft_idx = get_expected_shaft_indices_for_step(
         gears=gears,
         shafts=shafts,
@@ -880,7 +892,6 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
-    # Layer 4: geometry
     if short_sp_si != short_shaft_idx or long_sp_si != long_shaft_idx:
         errs.append({
             "code": "E_SPACER_POSITION_MISMATCH",
@@ -996,15 +1007,19 @@ def evaluate_assembly_errors(
 # =========================
 # Detection
 # =========================
-def run_detection_gear(img_bgr: np.ndarray, gear_model: Any) -> List[Dict[str, Any]]:
-    res = gear_model(img_bgr, verbose=False)[0]
+def _run_detection_xyxy(
+    img_bgr: np.ndarray,
+    model: Any,
+    conf_th: float,
+) -> List[Dict[str, Any]]:
+    res = model(img_bgr, verbose=False)[0]
     names = res.names
     dets: List[Dict[str, Any]] = []
 
     if res.boxes is not None and res.boxes.data is not None:
         for x1, y1, x2, y2, conf, cls_id in res.boxes.data.tolist():
             conf = float(conf)
-            if conf < CONF_GEAR:
+            if conf < conf_th:
                 continue
             cls_id = int(cls_id)
             cls = names.get(cls_id, str(cls_id))
@@ -1016,8 +1031,28 @@ def run_detection_gear(img_bgr: np.ndarray, gear_model: Any) -> List[Dict[str, A
     return dets
 
 
-def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[str, Any]]:
-    res = shaft_model(img_bgr, verbose=False)[0]
+def run_detection_model_a(img_bgr: np.ndarray, model_a: Any) -> List[Dict[str, Any]]:
+    dets = _run_detection_xyxy(img_bgr, model_a, CONF_MODEL_A)
+    filtered: List[Dict[str, Any]] = []
+    for d in dets:
+        cls = str(d["cls"])
+        if cls in DRIVING_GEAR_CLASS_NAMES or cls in (GEAR_BIG_NAME, GEAR_SMALL_NAME):
+            filtered.append(d)
+    return filtered
+
+
+def run_detection_model_c(img_bgr: np.ndarray, model_c: Any) -> List[Dict[str, Any]]:
+    dets = _run_detection_xyxy(img_bgr, model_c, CONF_MODEL_C)
+    filtered: List[Dict[str, Any]] = []
+    for d in dets:
+        cls = str(d["cls"])
+        if cls == MESH_CLASS_NAME or cls == MISMESH_CLASS_NAME or cls in SPACER_CLASSES:
+            filtered.append(d)
+    return filtered
+
+
+def run_detection_shaft_obb(img_bgr: np.ndarray, model_b: Any) -> List[Dict[str, Any]]:
+    res = model_b(img_bgr, verbose=False)[0]
     names = res.names
     dets: List[Dict[str, Any]] = []
 
@@ -1034,7 +1069,7 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
                 poly8 = row[:8]
                 conf = float(row[8])
                 cls_id = int(row[9])
-                if conf < CONF_SHAFT:
+                if conf < CONF_MODEL_B:
                     continue
                 cls = names.get(cls_id, str(cls_id))
                 if cls not in TARGET_SHAFT_CLASSES:
@@ -1050,7 +1085,7 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
                 cx, cy, w, h, ang = float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])
                 conf = float(row[5])
                 cls_id = int(row[6])
-                if conf < CONF_SHAFT:
+                if conf < CONF_MODEL_B:
                     continue
                 cls = names.get(cls_id, str(cls_id))
                 if cls not in TARGET_SHAFT_CLASSES:
@@ -1080,7 +1115,10 @@ def run_detection_shaft_obb(img_bgr: np.ndarray, shaft_model: Any) -> List[Dict[
 # =========================
 # Build objects
 # =========================
-def build_objects(gear_dets: List[Dict[str, Any]]) -> Tuple[
+def build_objects(
+    gear_dets: List[Dict[str, Any]],
+    aux_dets: List[Dict[str, Any]],
+) -> Tuple[
     List[Dict[str, Any]],
     List[Dict[str, Any]],
     List[Tuple[float, float, float, float]],
@@ -1092,6 +1130,19 @@ def build_objects(gear_dets: List[Dict[str, Any]]) -> Tuple[
     mismesh_boxes: List[Tuple[float, float, float, float]] = []
 
     for d in gear_dets:
+        cls = d["cls"]
+        if (cls in DRIVING_GEAR_CLASS_NAMES) or (cls in (GEAR_BIG_NAME, GEAR_SMALL_NAME)):
+            b = d["bbox"]
+            gears.append({
+                "gid": len(gears),
+                "cls": cls,
+                "score": d["score"],
+                "bbox": b,
+                "center": bbox_center(b),
+                "r": est_radius_from_bbox(b),
+            })
+
+    for d in aux_dets:
         cls = d["cls"]
         if cls == MESH_CLASS_NAME:
             mesh_boxes.append(d["bbox"])
@@ -1105,16 +1156,6 @@ def build_objects(gear_dets: List[Dict[str, Any]]) -> Tuple[
                 "score": d["score"],
                 "bbox": b,
                 "center": bbox_center(b),
-            })
-        elif (cls in DRIVING_GEAR_CLASS_NAMES) or (cls in (GEAR_BIG_NAME, GEAR_SMALL_NAME)):
-            b = d["bbox"]
-            gears.append({
-                "gid": len(gears),
-                "cls": cls,
-                "score": d["score"],
-                "bbox": b,
-                "center": bbox_center(b),
-                "r": est_radius_from_bbox(b),
             })
 
     return gears, spacers, mesh_boxes, mismesh_boxes
@@ -1140,7 +1181,6 @@ def assign_items_to_shafts(
     spacer_to_si: Dict[int, int] = {}
     si_to_spacers: Dict[int, List[int]] = {i: [] for i in range(len(shafts))}
 
-    # -------- gears: keep strict assignment --------
     for g in gears:
         c = g["center"]
         candidates = []
@@ -1152,7 +1192,6 @@ def assign_items_to_shafts(
             gear_to_si[g["gid"]] = best
             si_to_gids[best].append(g["gid"])
 
-    # -------- spacers: strict first, relaxed fallback second --------
     for sp in spacers:
         c = sp["center"]
 
@@ -1167,7 +1206,6 @@ def assign_items_to_shafts(
             si_to_spacers[best].append(sp["sid"])
             continue
 
-        # fallback by shaft-axis distance
         scored: List[Tuple[float, float, int]] = []
         for i, s in enumerate(shafts):
             axis_dist = dist_point_to_shaft_axis(c, s)
@@ -1523,13 +1561,16 @@ def _filter_errors_by_prefix(errors: List[Dict[str, str]], prefixes: Tuple[str, 
 # =========================
 def run_yolo_pipeline(
     img_bgr: np.ndarray,
-    gear_model_rel: str = DEFAULT_GEAR_MODEL_REL,
-    shaft_model_rel: str = DEFAULT_SHAFT_MODEL_REL,
+    model_a_rel: str = DEFAULT_MODEL_A_REL,
+    model_b_rel: str = DEFAULT_MODEL_B_REL,
+    model_c_rel: str = DEFAULT_MODEL_C_REL,
     return_images: bool = False,
     *,
     task: str = TASK_FULL,
     part_type: Optional[str] = None,
     expected_gears: Optional[int] = None,
+    gear_model_rel: Optional[str] = None,
+    shaft_model_rel: Optional[str] = None,
 ) -> Dict[str, Any]:
     if img_bgr is None or not hasattr(img_bgr, "shape"):
         raise ValueError("img_bgr must be a valid OpenCV image (BGR).")
@@ -1540,6 +1581,11 @@ def run_yolo_pipeline(
 
     part_type = str(part_type or "").strip().lower()
 
+    if gear_model_rel:
+        model_a_rel = gear_model_rel
+    if shaft_model_rel:
+        model_b_rel = shaft_model_rel
+
     global _COLD_START_FLAG
     is_cold_start = _COLD_START_FLAG
     _COLD_START_FLAG = False
@@ -1547,17 +1593,26 @@ def run_yolo_pipeline(
     t0_total = time.perf_counter()
     timing: Dict[str, float] = {}
 
-    gear_model, shaft_model = get_models(gear_model_rel, shaft_model_rel, timing=timing)
+    model_a, model_b, model_c = get_models(
+        model_a_rel=model_a_rel,
+        model_b_rel=model_b_rel,
+        model_c_rel=model_c_rel,
+        timing=timing,
+    )
 
-    t_g0 = time.perf_counter()
-    gear_dets = run_detection_gear(img_bgr, gear_model)
-    timing["t_infer_gear_s"] = float(time.perf_counter() - t_g0)
+    t_a0 = time.perf_counter()
+    gear_dets = run_detection_model_a(img_bgr, model_a)
+    timing["t_infer_model_a_s"] = float(time.perf_counter() - t_a0)
 
-    t_s0 = time.perf_counter()
-    shaft_obbs = run_detection_shaft_obb(img_bgr, shaft_model)
-    timing["t_infer_shaft_s"] = float(time.perf_counter() - t_s0)
+    t_b0 = time.perf_counter()
+    shaft_obbs = run_detection_shaft_obb(img_bgr, model_b)
+    timing["t_infer_model_b_s"] = float(time.perf_counter() - t_b0)
 
-    gears, spacers, mesh_boxes, mismesh_boxes = build_objects(gear_dets)
+    t_c0 = time.perf_counter()
+    aux_dets = run_detection_model_c(img_bgr, model_c)
+    timing["t_infer_model_c_s"] = float(time.perf_counter() - t_c0)
+
+    gears, spacers, mesh_boxes, mismesh_boxes = build_objects(gear_dets, aux_dets)
     contact_boxes = list(mesh_boxes) + list(mismesh_boxes)
 
     gear11_gid: Optional[int] = None
@@ -1608,6 +1663,7 @@ def run_yolo_pipeline(
             part_type=part_type,
             gear_dets=gear_dets,
             shaft_dets=shaft_obbs,
+            aux_dets=aux_dets,
         )
 
         out: Dict[str, Any] = {
@@ -1975,6 +2031,7 @@ def run_yolo_pipeline(
         "counts": get_gear_counts(gears),
         "detections": {
             "gear_dets": gear_dets,
+            "aux_dets": aux_dets,
             "shaft_obbs": shaft_obbs,
         },
         "objects": {

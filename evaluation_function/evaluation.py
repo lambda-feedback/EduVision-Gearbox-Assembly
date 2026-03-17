@@ -351,7 +351,8 @@ def _build_parts_inventory_message(out: Dict[str, Any], part_type: str) -> Tuple
         msg = (
             "Detected gears:\n"
             f"- biggear: {counts.get('biggear', 0)}\n"
-            f"- smallgear: {counts.get('smallgear', 0)}"
+            f"- smallgear: {counts.get('smallgear', 0)}\n"
+            f"- driving gear: {counts.get('driving_gear', counts.get('drivinggear', 0))}"
         )
         if not is_correct:
             msg += "\nPlease spread the gears out clearly and retake the photo."
@@ -451,7 +452,6 @@ def _build_student_message(
 
         n_long, n_short, n_total = _get_shaft_counts(out)
 
-        # ---- hard fallback by counts first ----
         if n_total > 0:
             if n_total != 2:
                 return False, MESSAGE_POLICY["shaft"]["count_fail"]
@@ -478,7 +478,6 @@ def _build_student_message(
         if task_has_error:
             return False, MESSAGE_POLICY["shaft"]["fail"]
 
-        # If no shaft counts are available, still allow pass only when pipeline reports no error.
         return True, MESSAGE_POLICY["shaft"]["pass"]
 
     if task == "spacer":
@@ -490,9 +489,9 @@ def _build_student_message(
 
         n_long, n_short, n_total = _get_spacer_counts(out)
 
-        # ---- Layer 1: hard fallback by counts first ----
-        # Only activate when spacer counts are actually provided by the pipeline.
-        if ("spacer_long" in _get_counts_dict(out)) or ("spacer_short" in _get_counts_dict(out)):
+        counts_dict = _get_counts_dict(out)
+
+        if ("spacer_long" in counts_dict) or ("spacer_short" in counts_dict):
             if n_total == 0:
                 return False, MESSAGE_POLICY["spacer"]["count_fail"]
 
@@ -505,7 +504,6 @@ def _build_student_message(
             if n_short != 1 or n_long != 1 or n_total != 2:
                 return False, MESSAGE_POLICY["spacer"]["count_fail"]
 
-        # ---- Layer 2: explicit pipeline error codes ----
         if "E_SPACER_SHORT_MISSING" in codes:
             return False, MESSAGE_POLICY["spacer"]["short_missing"]
 
@@ -518,7 +516,6 @@ def _build_student_message(
         if "E_SPACER_TYPE_CONFUSION" in codes:
             return False, MESSAGE_POLICY["spacer"]["type_confusion"]
 
-        # Assignment / visibility ambiguity should not be mapped to position mismatch.
         if (
             "E_SPACER_ASSIGNMENT_FAIL" in codes
             or "E_SPACER2_MISSING" in codes
@@ -526,7 +523,6 @@ def _build_student_message(
         ):
             return False, MESSAGE_POLICY["spacer"]["assignment_fail"]
 
-        # True geometric mismatch after assignment succeeded.
         if (
             "E_SPACER_POSITION_MISMATCH" in codes
             or "E_SPACER2_TYPE_MISMATCH" in codes
@@ -618,6 +614,97 @@ def _build_student_message(
     return False, "Unsupported task."
 
 
+def _call_pipeline_with_fallbacks(
+    *,
+    img_bgr: np.ndarray,
+    model_a_rel: str,
+    model_b_rel: str,
+    model_c_rel: str,
+    return_images: bool,
+    task: str,
+    part_type: str,
+    expected_gears: Any,
+) -> Dict[str, Any]:
+    """
+    Preferred new signature:
+        run_yolo_pipeline(
+            img_bgr=...,
+            model_a_rel=...,
+            model_b_rel=...,
+            model_c_rel=...,
+            return_images=...,
+            task=...,
+            part_type=...,
+            expected_gears=...,
+        )
+
+    Backward-compatibility fallback:
+        run_yolo_pipeline(
+            img_bgr=...,
+            gear_model_rel=...,
+            shaft_model_rel=...,
+            return_images=...,
+            task=...,
+            part_type=...,
+            expected_gears=...,
+        )
+    """
+    # New 3-model API
+    try:
+        return run_yolo_pipeline(  # type: ignore[misc]
+            img_bgr=img_bgr,
+            model_a_rel=model_a_rel,
+            model_b_rel=model_b_rel,
+            model_c_rel=model_c_rel,
+            return_images=return_images,
+            task=task,
+            part_type=part_type,
+            expected_gears=expected_gears,
+        )
+    except TypeError:
+        pass
+
+    # New 3-model API without part_type
+    try:
+        return run_yolo_pipeline(  # type: ignore[misc]
+            img_bgr=img_bgr,
+            model_a_rel=model_a_rel,
+            model_b_rel=model_b_rel,
+            model_c_rel=model_c_rel,
+            return_images=return_images,
+            task=task,
+            expected_gears=expected_gears,
+        )
+    except TypeError:
+        pass
+
+    # Old 2-model fallback:
+    # model_a_rel -> gear_model_rel
+    # model_b_rel -> shaft_model_rel
+    try:
+        return run_yolo_pipeline(  # type: ignore[misc]
+            img_bgr=img_bgr,
+            gear_model_rel=model_a_rel,
+            shaft_model_rel=model_b_rel,
+            return_images=return_images,
+            task=task,
+            part_type=part_type,
+            expected_gears=expected_gears,
+        )
+    except TypeError:
+        pass
+
+    # Old 2-model fallback without part_type
+    return run_yolo_pipeline(  # type: ignore[misc]
+        img_bgr=img_bgr,
+        gear_model_rel=model_a_rel,
+        shaft_model_rel=model_b_rel,
+        return_images=return_images,
+        task=task,
+        expected_gears=expected_gears,
+    )
+
+
 def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     task = str(_pget(params, "task", "full") or "full").strip().lower()
     part_type = str(_pget(params, "part_type", "") or "").strip().lower()
@@ -632,8 +719,14 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
     return_images: bool = bool(
         _pget(params, "return_images", pipeline_task not in ("precheck", "parts_inventory", "single_stage"))
     )
-    gear_model_rel = str(_pget(params, "gear_model_rel", "gear_model.pt"))
-    shaft_model_rel = str(_pget(params, "shaft_model_rel", "shaft_model.pt"))
+
+    # ----------------------------
+    # New 3-model params
+    # ----------------------------
+    model_a_rel = str(_pget(params, "model_a_rel", _pget(params, "gear_model_rel", "modelA.pt")))
+    model_b_rel = str(_pget(params, "model_b_rel", _pget(params, "shaft_model_rel", "modelB.pt")))
+    model_c_rel = str(_pget(params, "model_c_rel", "modelC.pt"))
+
     expected_gears = _pget(params, "expected_gears", None)
 
     if not isinstance(response, list) or len(response) == 0:
@@ -655,22 +748,14 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         )
 
     try:
-        out: Dict[str, Any] = run_yolo_pipeline(  # type: ignore[misc]
+        out: Dict[str, Any] = _call_pipeline_with_fallbacks(
             img_bgr=img_bgr,
-            gear_model_rel=gear_model_rel,
-            shaft_model_rel=shaft_model_rel,
+            model_a_rel=model_a_rel,
+            model_b_rel=model_b_rel,
+            model_c_rel=model_c_rel,
             return_images=return_images,
             task=pipeline_task,
             part_type=part_type,
-            expected_gears=expected_gears,
-        )
-    except TypeError:
-        out = run_yolo_pipeline(  # type: ignore[misc]
-            img_bgr=img_bgr,
-            gear_model_rel=gear_model_rel,
-            shaft_model_rel=shaft_model_rel,
-            return_images=return_images,
-            task=pipeline_task,
             expected_gears=expected_gears,
         )
     except Exception:
