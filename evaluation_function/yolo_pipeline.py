@@ -55,9 +55,6 @@ LINE_HIT_RATIO_TH: float = 0.25
 REQUIRE_DIFFERENT_SHAFT: bool = True
 REQUIRE_BIG_SMALL_PAIR: bool = True
 
-FORCE_STAGE1_BY_SHORT_SPACER: bool = True
-STAGE1_MATE_MUST_BE_GEAR_BIG: bool = True
-
 ONE_TO_ONE_CONTACT_BOX: bool = True
 MAX_STAGE: int = 6
 
@@ -465,9 +462,7 @@ def build_output_images(
     ratio = ratio or {}
     errors = errors or []
 
-    # =========================
-    # det_img: only detection content
-    # =========================
+    # Detection image
     for s in shaft_obbs:
         if "poly4" in s and s["poly4"] is not None:
             poly = np.asarray(s["poly4"], dtype=np.int32).reshape((-1, 1, 2))
@@ -497,9 +492,7 @@ def build_output_images(
         draw_bbox(det_img, g["bbox"], (0, 255, 0), 2)
         put_text_outline(det_img, f"{g['cls']} {g['score']:.2f}", (g["bbox"][0] + 3, g["bbox"][1] - 6), 0.55, 2, (0, 255, 0))
 
-    # =========================
-    # label_img: reasoning visualization
-    # =========================
+    # Label image
     for g in gears:
         draw_bbox(label_img, g["bbox"], (0, 120, 0), 1)
         cx, cy = int(g["center"][0]), int(g["center"][1])
@@ -953,7 +946,7 @@ def get_expected_shaft_indices_for_step(
     shafts: List[Dict[str, Any]],
     gear11_gid: int,
 ) -> Tuple[Optional[int], Optional[int]]:
-    if not gears or not shafts or len(shafts) < 2:
+    if not gears or not shafts:
         return None, None
 
     g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
@@ -961,25 +954,11 @@ def get_expected_shaft_indices_for_step(
         return None, None
 
     c11 = g11["center"]
-    dlist: List[Tuple[float, int]] = []
-    for i, s in enumerate(shafts):
-        dlist.append((center_dist(s["center"], c11), i))
+    ranked = rank_shafts_from_gear11(shafts, c11)
 
-    dlist.sort(key=lambda x: x[0])
-
-    if len(dlist) < 2:
-        return None, None
-
-    d0 = float(dlist[0][0])
-    d1 = float(dlist[1][0])
-    ref = max(d1, 1.0)
-
-    if abs(d1 - d0) / ref < SHAFT_DISTANCE_AMBIG_RATIO:
-        return None, None
-
-    short_shaft_idx = dlist[0][1]
-    long_shaft_idx = dlist[1][1]
-    return short_shaft_idx, long_shaft_idx
+    shaft2 = ranked[0] if len(ranked) >= 1 else None
+    shaft3 = ranked[1] if len(ranked) >= 2 else None
+    return shaft2, shaft3
 
 
 def pick_shaft2_and_shaft3_by_distance(
@@ -995,18 +974,12 @@ def pick_shaft2_and_shaft3_by_distance(
     if g11 is None:
         return None, None, None
 
-    shaft1 = gear_to_si.get(gear11_gid)
     c11 = g11["center"]
+    ranked = rank_shafts_from_gear11(shafts, c11)
 
-    dlist: List[Tuple[float, int]] = []
-    for i, s in enumerate(shafts):
-        if shaft1 is not None and i == shaft1:
-            continue
-        dlist.append((center_dist(s["center"], c11), i))
-
-    dlist.sort(key=lambda x: x[0])
-    shaft2 = dlist[0][1] if len(dlist) >= 1 else None
-    shaft3 = dlist[1][1] if len(dlist) >= 2 else None
+    shaft1 = gear_to_si.get(gear11_gid)
+    shaft2 = ranked[0] if len(ranked) >= 1 else None
+    shaft3 = ranked[1] if len(ranked) >= 2 else None
     return shaft1, shaft2, shaft3
 
 
@@ -1025,50 +998,29 @@ def evaluate_shaft_step_errors(
         errs.append({"code": "E_SHAFT_COUNT_MISMATCH", "message": "No shafts detected."})
         return errs
 
-    if len(shafts) == 1:
-        errs.append({"code": "E_SHAFT_COUNT_MISMATCH", "message": "Only one shaft detected."})
-        return errs
-
-    if len(shafts) != 2:
-        errs.append({
-            "code": "E_SHAFT_COUNT_MISMATCH",
-            "message": f"Expected 2 shafts, but detected {len(shafts)}."
-        })
-        return errs
-
     g11 = next((g for g in gears if g["gid"] == gear11_gid), None)
     if g11 is None:
         errs.append({"code": "E_NO_GEAR11", "message": "Cannot determine gear11."})
         return errs
 
     c11 = g11["center"]
+    ranked = rank_shafts_from_gear11(shafts, c11)
 
-    shaft_info: List[Dict[str, Any]] = []
-    for i, s in enumerate(shafts):
-        shaft_info.append({
-            "index": i,
-            "cls": str(s["cls"]),
-            "dist": center_dist(s["center"], c11),
-        })
+    if len(ranked) >= 1:
+        shaft2_idx = ranked[0]
+        if str(shafts[shaft2_idx]["cls"]) == "shaft_long":
+            errs.append({
+                "code": "E_SHAFT_POSITION_SWAP",
+                "message": "The closest shaft to gear11 is classified as shaft_long, but shaft2 is expected to be shaft_short.",
+            })
 
-    short_shafts = [s for s in shaft_info if s["cls"] == "shaft_short"]
-    long_shafts = [s for s in shaft_info if s["cls"] == "shaft_long"]
-
-    if len(short_shafts) != 1 or len(long_shafts) != 1:
-        errs.append({
-            "code": "E_SHAFT_TYPE_CONFUSION",
-            "message": "The shaft types could not be identified reliably."
-        })
-        return errs
-
-    short_dist = float(short_shafts[0]["dist"])
-    long_dist = float(long_shafts[0]["dist"])
-
-    if long_dist < short_dist:
-        errs.append({
-            "code": "E_SHAFT_POSITION_SWAP",
-            "message": "The shaft positions appear to be swapped."
-        })
+    if len(ranked) >= 2:
+        shaft3_idx = ranked[1]
+        if str(shafts[shaft3_idx]["cls"]) == "shaft_short":
+            errs.append({
+                "code": "E_SHAFT_POSITION_SWAP",
+                "message": "The second closest shaft to gear11 is classified as shaft_short, but shaft3 is expected to be shaft_long.",
+            })
 
     return errs
 
@@ -1128,11 +1080,20 @@ def evaluate_spacer_step_errors(
         cls_name = str(sp["cls"]).lower().replace(" ", "_")
 
         if "short" in cls_name:
-            errs.append({"code": "E_SPACER_LONG_MISSING", "message": "Only the short spacer was detected."})
+            errs.append({
+                "code": "E_SPACER_LONG_MISSING",
+                "message": "Only the short spacer was detected."
+            })
         elif "long" in cls_name:
-            errs.append({"code": "E_SPACER_SHORT_MISSING", "message": "Only the long spacer was detected."})
+            errs.append({
+                "code": "E_SPACER_SHORT_MISSING",
+                "message": "Only the long spacer was detected."
+            })
         else:
-            errs.append({"code": "E_SPACER_COUNT_MISMATCH", "message": "Only one spacer was detected."})
+            errs.append({
+                "code": "E_SPACER_COUNT_MISMATCH",
+                "message": "Only one spacer was detected."
+            })
         return errs
 
     if len(spacers) != 2:
@@ -1146,11 +1107,17 @@ def evaluate_spacer_step_errors(
     long_spacers = [sp for sp in spacers if spacer_is_long(sp)]
 
     if len(short_spacers) == 0 and len(long_spacers) == 2:
-        errs.append({"code": "E_SPACER_TYPE_CONFUSION", "message": "Two long spacers were detected."})
+        errs.append({
+            "code": "E_SPACER_TYPE_CONFUSION",
+            "message": "Two long spacers were detected."
+        })
         return errs
 
     if len(short_spacers) == 2 and len(long_spacers) == 0:
-        errs.append({"code": "E_SPACER_TYPE_CONFUSION", "message": "Two short spacers were detected."})
+        errs.append({
+            "code": "E_SPACER_TYPE_CONFUSION",
+            "message": "Two short spacers were detected."
+        })
         return errs
 
     if len(short_spacers) != 1 or len(long_spacers) != 1:
@@ -1163,13 +1130,25 @@ def evaluate_spacer_step_errors(
     short_sp = short_spacers[0]
     long_sp = long_spacers[0]
 
-    short_shaft_idx, long_shaft_idx = get_expected_shaft_indices_for_step(
+    # Strong direct geometric rule first
+    d_short = center_dist(short_sp["center"], c11)
+    d_long = center_dist(long_sp["center"], c11)
+    tol_px = relative_spacer_distance_tol(shafts, gears)
+
+    if d_short > d_long + tol_px:
+        errs.append({
+            "code": "E_SPACER_DISTANCE_ORDER",
+            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={tol_px:.1f}px)."
+        })
+        return errs
+
+    shaft2_idx, shaft3_idx = get_expected_shaft_indices_for_step(
         gears=gears,
         shafts=shafts,
         gear11_gid=gear11_gid,
     )
 
-    if short_shaft_idx is None or long_shaft_idx is None:
+    if shaft2_idx is None or shaft3_idx is None:
         errs.append({
             "code": "E_SPACER_ASSIGNMENT_FAIL",
             "message": "The expected shaft identities could not be determined reliably."
@@ -1186,25 +1165,28 @@ def evaluate_spacer_step_errors(
         })
         return errs
 
-    if short_sp_si != short_shaft_idx or long_sp_si != long_shaft_idx:
+    if short_sp_si != shaft2_idx and long_sp_si != shaft3_idx:
         errs.append({
             "code": "E_SPACER_POSITION_MISMATCH",
-            "message": "The spacer positions appear to be incorrect."
+            "message": "The spacers appear to be swapped between shaft2 and shaft3."
         })
         return errs
 
-    d_short = center_dist(short_sp["center"], c11)
-    d_long = center_dist(long_sp["center"], c11)
-    tol_px = relative_spacer_distance_tol(shafts, gears)
-
-    if d_short > d_long + tol_px:
+    if short_sp_si != shaft2_idx:
         errs.append({
-            "code": "E_SPACER_DISTANCE_ORDER",
-            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={tol_px:.1f}px)."
+            "code": "E_SPACER2_TYPE_MISMATCH",
+            "message": "The spacer on shaft2 is not the short spacer."
         })
+        return errs
+
+    if long_sp_si != shaft3_idx:
+        errs.append({
+            "code": "E_SPACER3_TYPE_MISMATCH",
+            "message": "The spacer on shaft3 is not the long spacer."
+        })
+        return errs
 
     return errs
-
 
 # =========================
 # Assembly checks for full path
@@ -1234,41 +1216,62 @@ def evaluate_assembly_errors(
         return errs
     c11 = g11["center"]
 
-    shaft1, shaft2, shaft3 = pick_shaft2_and_shaft3_by_distance(shafts, gear11_gid, gear_to_si, gears)
+    shaft1, shaft2, shaft3 = pick_shaft2_and_shaft3_by_distance(
+        shafts, gear11_gid, gear_to_si, gears
+    )
 
     if shaft2 is not None and 0 <= shaft2 < len(shafts):
         if str(shafts[shaft2]["cls"]) == "shaft_long":
             errs.append({
                 "code": "E_SHAFT2_CLASS_MISMATCH",
-                "message": "Assembly issue: shaft2 (closest shaft to gear11) is classified as 'shaft_long' (expected 'shaft_short')."
+                "message": "Assembly issue: shaft2 (closest detected shaft to gear11) is classified as 'shaft_long' (expected 'shaft_short')."
+            })
+
+    if shaft3 is not None and 0 <= shaft3 < len(shafts):
+        if str(shafts[shaft3]["cls"]) == "shaft_short":
+            errs.append({
+                "code": "E_SHAFT3_CLASS_MISMATCH",
+                "message": "Assembly issue: shaft3 (second closest detected shaft to gear11) is classified as 'shaft_short' (expected 'shaft_long')."
             })
 
     spacer2 = pick_spacer_on_shaft_as(spacers, spacer_to_si, shaft2, c11) if shaft2 is not None else None
     spacer3 = pick_spacer_on_shaft_as(spacers, spacer_to_si, shaft3, c11) if shaft3 is not None else None
 
-    if shaft2 is not None:
-        if spacer2 is None:
-            errs.append({
-                "code": "E_SPACER2_MISSING",
-                "message": "Assembly issue: no spacer found on shaft2 (spacer2 missing or not assigned to shaft2)."
-            })
-        elif spacer_is_long(spacer2):
-            errs.append({
-                "code": "E_SPACER2_TYPE_MISMATCH",
-                "message": "Assembly issue: spacer2 (spacer on shaft2) is classified as 'long spacer' (expected 'short spacer')."
-            })
+    if shaft2 is not None and spacer2 is None:
+        errs.append({
+            "code": "E_SPACER2_MISSING",
+            "message": "Assembly issue: no spacer found on shaft2."
+        })
 
-    if shaft3 is not None:
-        if spacer3 is None:
-            errs.append({
-                "code": "E_SPACER3_MISSING",
-                "message": "Assembly issue: no spacer found on shaft3 (spacer3 missing or not assigned to shaft3)."
-            })
-        elif spacer_is_short(spacer3):
-            errs.append({
-                "code": "E_SPACER3_TYPE_MISMATCH",
-                "message": "Assembly issue: spacer3 (spacer on shaft3) is classified as 'short spacer' (expected 'long spacer')."
-            })
+    if shaft3 is not None and spacer3 is None:
+        errs.append({
+            "code": "E_SPACER3_MISSING",
+            "message": "Assembly issue: no spacer found on shaft3."
+        })
+
+    # Strict spacer type-position checks
+    if spacer2 is not None and not spacer_is_short(spacer2):
+        errs.append({
+            "code": "E_SPACER2_TYPE_MISMATCH",
+            "message": "Assembly issue: the spacer on shaft2 is not the short spacer."
+        })
+
+    if spacer3 is not None and not spacer_is_long(spacer3):
+        errs.append({
+            "code": "E_SPACER3_TYPE_MISMATCH",
+            "message": "Assembly issue: the spacer on shaft3 is not the long spacer."
+        })
+
+    if (
+        spacer2 is not None
+        and spacer3 is not None
+        and (not spacer_is_short(spacer2))
+        and (not spacer_is_long(spacer3))
+    ):
+        errs.append({
+            "code": "E_SPACER_POSITION_MISMATCH",
+            "message": "Assembly issue: the short and long spacers appear to be swapped between shaft2 and shaft3."
+        })
 
     if spacer2 is not None and spacer3 is not None:
         d2 = center_dist(spacer2["center"], c11)
@@ -1278,7 +1281,7 @@ def evaluate_assembly_errors(
         if d2 > d3 + tol_px:
             errs.append({
                 "code": "E_SPACER_DISTANCE_ORDER",
-                "message": f"Consistency check: spacer2 is not closer to gear11 than spacer3 (tol={tol_px:.1f}px)."
+                "message": f"Consistency check: the spacer on shaft2 is not closer to gear11 than the spacer on shaft3 (tol={tol_px:.1f}px)."
             })
 
     total_contact = len(mesh_boxes) + len(mismesh_boxes)
@@ -1475,7 +1478,7 @@ def assign_items_to_shafts(
     spacer_to_si: Dict[int, int] = {}
     si_to_spacers: Dict[int, List[int]] = {i: [] for i in range(len(shafts))}
 
-    # gears
+    # Assign gears
     for g in gears:
         c = g["center"]
 
@@ -1514,7 +1517,7 @@ def assign_items_to_shafts(
                 gear_to_si[g["gid"]] = best_i
                 si_to_gids[best_i].append(g["gid"])
 
-    # spacers
+    # Assign spacers
     for sp in spacers:
         c = sp["center"]
 
@@ -1662,7 +1665,7 @@ def pick_compound_on_same_shaft(
     si = gear_to_si.get(gid_base, None)
     g0 = gears_by_gid(gears, gid_base)
 
-    # strict same-shaft search
+    # Strict same-shaft search
     if si is not None:
         candidates = []
         for g in gears:
@@ -1679,7 +1682,7 @@ def pick_compound_on_same_shaft(
             candidates.sort(key=lambda x: x[0])
             return candidates[0][1]
 
-    # fallback by proximity
+    # Fallback by proximity
     fallback = []
     for g in gears:
         gid = g["gid"]
@@ -1701,55 +1704,84 @@ def pick_compound_on_same_shaft(
     return None
 
 
-def find_stage2_shaft_index_by_short_spacer(
+def rank_shafts_from_gear11(
+    shafts: List[Dict[str, Any]],
+    gear11_center: Tuple[float, float],
+) -> List[int]:
+    ranked: List[Tuple[float, int]] = []
+    for i, s in enumerate(shafts):
+        d = center_dist(s["center"], gear11_center)
+        ranked.append((d, i))
+    ranked.sort(key=lambda x: x[0])
+    return [i for _, i in ranked]
+
+
+def pick_nearest_spacer_on_shaft_to_gear11(
     spacers: List[Dict[str, Any]],
     spacer_to_si: Dict[int, int],
-) -> Tuple[Optional[int], Optional[int]]:
-    short_sps = []
+    shaft_idx: int,
+    gear11_center: Tuple[float, float],
+) -> Optional[Dict[str, Any]]:
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
     for sp in spacers:
-        if spacer_is_short(sp):
-            sid = sp["sid"]
-            si = spacer_to_si.get(sid)
-            if si is None:
-                continue
-            short_sps.append((sp["score"], si, sid))
-    if not short_sps:
-        return None, None
-    short_sps.sort(key=lambda x: x[0], reverse=True)
-    _, si, sid = short_sps[0]
-    return si, sid
+        if spacer_to_si.get(sp["sid"]) != shaft_idx:
+            continue
+        d = center_dist(sp["center"], gear11_center)
+        candidates.append((d, sp))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
-def pick_closest_gear_to_spacer_on_shaft(
-    si_target: int,
-    spacer_center: Tuple[float, float],
+def pick_nearest_gear_on_shaft_to_point(
     gears: List[Dict[str, Any]],
     gear_to_si: Dict[int, int],
-    median_r: float,
-    require_big: bool = False,
+    shaft_idx: int,
+    ref_pt: Tuple[float, float],
     forbid_gid: Optional[int] = None,
 ) -> Optional[int]:
-    best = None
+    candidates: List[Tuple[float, int]] = []
     for g in gears:
         gid = g["gid"]
         if forbid_gid is not None and gid == forbid_gid:
             continue
-        if gear_to_si.get(gid) != si_target:
+        if gear_to_si.get(gid) != shaft_idx:
             continue
-        if require_big:
-            if not is_big(g, median_r):
-                continue
-            if g["cls"] != GEAR_BIG_NAME:
-                continue
-        d = center_dist(g["center"], spacer_center)
-        if (best is None) or (d < best[0]):
-            best = (d, gid)
-    return None if best is None else best[1]
+        d = center_dist(g["center"], ref_pt)
+        candidates.append((d, gid))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def find_best_contact_box_for_pair(
+    gA: Dict[str, Any],
+    gB: Dict[str, Any],
+    contact_boxes: List[Tuple[float, float, float, float]],
+    used_contact_idx: set,
+) -> Tuple[float, Optional[int], Optional[Tuple[float, float, float, float]]]:
+    best = None
+    for cidx, box in enumerate(contact_boxes):
+        if ONE_TO_ONE_CONTACT_BOX and (cidx in used_contact_idx):
+            continue
+        ret = score_pair_by_contact_box(gA, gB, box)
+        if ret is None:
+            continue
+        sc, hit, dms, gap = ret
+        if (best is None) or (sc > best[0]):
+            best = (sc, hit, cidx, box)
+
+    if best is None:
+        return 0.0, None, None
+    return best[1], best[2], best[3]
 
 
 def stage_role_naming_chain(
     gears: List[Dict[str, Any]],
     spacers: List[Dict[str, Any]],
+    shafts: List[Dict[str, Any]],
     contact_boxes: List[Tuple[float, float, float, float]],
     gear_to_si: Dict[int, int],
     spacer_to_si: Dict[int, int],
@@ -1763,66 +1795,53 @@ def stage_role_naming_chain(
     used_contact_idx = set()
     chain_pairs: List[Tuple[int, int, float, Optional[Tuple[float, float, float, float]]]] = []
 
+    # Stage 1 anchor
     labels[gear11_gid] = "gear11"
     stage_of[gear11_gid] = 1
     used_gids.add(gear11_gid)
+
+    g11 = gears_by_gid(gears, gear11_gid)
+    c11 = g11["center"]
+
+    # New deterministic rule:
+    # 1) gear11 is fixed as the driving gear
+    # 2) sort all detected shafts by distance to gear11 center
+    # 3) the nearest shaft is shaft2
+    # 4) choose the spacer on shaft2 that is nearest to gear11 center
+    # 5) use that spacer center as the local reference point on shaft2
+    # 6) choose the nearest gear on shaft2 to that local reference point as gear12
+    ranked_shafts = rank_shafts_from_gear11(shafts, c11)
+    shaft2 = ranked_shafts[0] if len(ranked_shafts) >= 1 else None
 
     mate12 = None
     hit12 = 0.0
     box12 = None
     cidx12 = None
 
-    if FORCE_STAGE1_BY_SHORT_SPACER:
-        si2, sid_short = find_stage2_shaft_index_by_short_spacer(spacers, spacer_to_si)
-        if si2 is not None and sid_short is not None:
-            sp_short = next(sp for sp in spacers if sp["sid"] == sid_short)
+    if shaft2 is not None:
+        spacer2 = pick_nearest_spacer_on_shaft_to_gear11(
+            spacers=spacers,
+            spacer_to_si=spacer_to_si,
+            shaft_idx=shaft2,
+            gear11_center=c11,
+        )
 
-            mate12 = pick_closest_gear_to_spacer_on_shaft(
-                si_target=si2,
-                spacer_center=sp_short["center"],
+        if spacer2 is not None:
+            mate12 = pick_nearest_gear_on_shaft_to_point(
                 gears=gears,
                 gear_to_si=gear_to_si,
-                median_r=median_r,
-                require_big=STAGE1_MATE_MUST_BE_GEAR_BIG,
+                shaft_idx=shaft2,
+                ref_pt=spacer2["center"],
                 forbid_gid=gear11_gid,
             )
-            if mate12 is None:
-                mate12 = pick_closest_gear_to_spacer_on_shaft(
-                    si_target=si2,
-                    spacer_center=sp_short["center"],
-                    gears=gears,
-                    gear_to_si=gear_to_si,
-                    median_r=median_r,
-                    require_big=False,
-                    forbid_gid=gear11_gid,
-                )
 
             if mate12 is not None:
-                gA = gears_by_gid(gears, gear11_gid)
-                gB = gears_by_gid(gears, mate12)
-                best_local = None
-                for cidx, box in enumerate(contact_boxes):
-                    if ONE_TO_ONE_CONTACT_BOX and (cidx in used_contact_idx):
-                        continue
-                    ret = score_pair_by_contact_box(gA, gB, box)
-                    if ret is None:
-                        continue
-                    sc, hit, dms, gap = ret
-                    if (best_local is None) or (sc > best_local[0]):
-                        best_local = (sc, hit, cidx, box)
-                if best_local is not None:
-                    _, hit12, cidx12, box12 = best_local
-
-    if mate12 is None:
-        mate12, hit12, cidx12, box12 = find_best_mate_for(
-            gidA=gear11_gid,
-            gears=gears,
-            contact_boxes=contact_boxes,
-            gear_to_si=gear_to_si,
-            median_r=median_r,
-            used_gids=used_gids,
-            used_contact_idx=used_contact_idx,
-        )
+                hit12, cidx12, box12 = find_best_contact_box_for_pair(
+                    gA=g11,
+                    gB=gears_by_gid(gears, mate12),
+                    contact_boxes=contact_boxes,
+                    used_contact_idx=used_contact_idx,
+                )
 
     if mate12 is None:
         return labels, stage_of, chain_pairs
@@ -1836,6 +1855,7 @@ def stage_role_naming_chain(
     chain_pairs.append((gear11_gid, mate12, hit12, box12))
     prev_driven = mate12
 
+    # Remaining stages keep the original chain logic
     for stage in range(2, MAX_STAGE + 1):
         driving = pick_compound_on_same_shaft(prev_driven, gears, gear_to_si, used_gids)
         if driving is None:
@@ -2171,6 +2191,7 @@ def run_yolo_pipeline(
         gear_names, gear_stage, chain_pairs = stage_role_naming_chain(
             gears=gears,
             spacers=spacers,
+            shafts=shaft_obbs,
             contact_boxes=contact_boxes,
             gear_to_si=gear_to_si,
             spacer_to_si=spacer_to_si,
@@ -2461,6 +2482,7 @@ def run_yolo_pipeline(
     gear_names, gear_stage, chain_pairs = stage_role_naming_chain(
         gears=gears,
         spacers=spacers,
+        shafts=shaft_obbs,
         contact_boxes=contact_boxes,
         gear_to_si=gear_to_si,
         spacer_to_si=spacer_to_si,
