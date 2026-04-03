@@ -71,7 +71,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "type_confusion": "The spacer types could not be identified reliably. Please retake the photo from a clearer angle and make sure both spacers are fully visible.",
         "assignment_fail": "The spacers were detected, but their positions could not be determined reliably. Please retake the photo from a clearer top view and make sure both spacers are fully visible.",
         "position_mismatch": "The spacer positions appear to be incorrect. Please make sure the short spacer is on the short shaft and the long spacer is on the long shaft.",
-        "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to gear 1 than the long spacer.",
+        "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to white gear than the long spacer.",
         "fail": "Please check the spacer setup again.",
     },
     "gear_inventory": {
@@ -105,7 +105,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         ),
     },
     "mesh_ratio": {
-        "fail": "Please check the gear meshing again. The detected gear contacts do not match the expected setup.",
+        "fail": "Please check the assembly again. The detected setup is not correct enough for reliable gear-ratio calculation.",
         "calc_fail": "The assembly was detected, but the gear ratio could not be calculated reliably. Please check the gear arrangement again.",
         "stage_below_target": (
             "Detected stages: {num_stages}.\n"
@@ -259,6 +259,8 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
                 ("MESH" in code)
                 or code.startswith("E_CONTACT_COUNT")
                 or code == "E_NO_GEARS"
+                or code == "E_NO_SHAFTS"
+                or code == "E_NO_GEAR11"
                 or code == "E_GEAR_COUNT_UNSUPPORTED"
                 or code.startswith("E_SHAFT")
                 or code.startswith("E_SPACER")
@@ -467,13 +469,14 @@ def _build_student_message(
             return False, MESSAGE_POLICY["shaft"]["count_fail"]
 
         if (
-            "E_SHAFT_TYPE_CONFUSION" in codes
+            "E_SHAFT_POSITION_SWAP" in codes
             or "E_SHAFT2_CLASS_MISMATCH" in codes
+            or "E_SHAFT3_CLASS_MISMATCH" in codes
         ):
-            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
-
-        if "E_SHAFT_POSITION_SWAP" in codes:
             return False, MESSAGE_POLICY["shaft"]["position_swap"]
+
+        if "E_SHAFT_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
 
         if task_has_error:
             return False, MESSAGE_POLICY["shaft"]["fail"]
@@ -488,7 +491,6 @@ def _build_student_message(
         }
 
         n_long, n_short, n_total = _get_spacer_counts(out)
-
         counts_dict = _get_counts_dict(out)
 
         if ("spacer_long" in counts_dict) or ("spacer_short" in counts_dict):
@@ -575,6 +577,76 @@ def _build_student_message(
         )
 
     if task == "mesh_ratio":
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
+
+        # Highest-priority prerequisite errors
+        if "E_NO_GEARS" in codes:
+            return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
+
+        if "E_NO_SHAFTS" in codes or "E_NO_GEAR11" in codes:
+            return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
+
+        # Spacer checks
+        if "E_SPACER_SHORT_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["short_missing"]
+
+        if "E_SPACER_LONG_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["long_missing"]
+
+        if "E_SPACER_COUNT_MISMATCH" in codes:
+            return False, MESSAGE_POLICY["spacer"]["count_fail"]
+
+        if "E_SPACER_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["spacer"]["type_confusion"]
+
+        if (
+            "E_SPACER_ASSIGNMENT_FAIL" in codes
+            or "E_SPACER2_MISSING" in codes
+            or "E_SPACER3_MISSING" in codes
+        ):
+            return False, MESSAGE_POLICY["spacer"]["assignment_fail"]
+
+        if (
+            "E_SPACER_POSITION_MISMATCH" in codes
+            or "E_SPACER2_TYPE_MISMATCH" in codes
+            or "E_SPACER3_TYPE_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["spacer"]["position_mismatch"]
+
+        if "E_SPACER_DISTANCE_ORDER" in codes:
+            return False, MESSAGE_POLICY["spacer"]["distance_order"]
+
+        # Shaft checks
+        if (
+            "E_SHAFT_POSITION_SWAP" in codes
+            or "E_SHAFT2_CLASS_MISMATCH" in codes
+            or "E_SHAFT3_CLASS_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["shaft"]["position_swap"]
+
+        if (
+            "E_SHAFT_COUNT_MISMATCH" in codes
+            or "E_SHAFT2_NOT_FOUND" in codes
+        ):
+            return False, MESSAGE_POLICY["shaft"]["count_fail"]
+
+        if "E_SHAFT_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
+
+        # Mesh and consistency checks
+        if (
+            "E_MISMESH_DETECTED" in codes
+            or "E_MESH_MISMATCH" in codes
+            or "E_CONTACT_COUNT_MISMATCH" in codes
+            or "E_GEAR_COUNT_UNSUPPORTED" in codes
+        ):
+            return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
+
+        # Final ratio output only if all checks pass
         is_correct = not _has_pipeline_error(errors)
         if not is_correct:
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
@@ -649,7 +721,6 @@ def _call_pipeline_with_fallbacks(
             expected_gears=...,
         )
     """
-    # New 3-model API
     try:
         return run_yolo_pipeline(  # type: ignore[misc]
             img_bgr=img_bgr,
@@ -664,7 +735,6 @@ def _call_pipeline_with_fallbacks(
     except TypeError:
         pass
 
-    # New 3-model API without part_type
     try:
         return run_yolo_pipeline(  # type: ignore[misc]
             img_bgr=img_bgr,
@@ -678,9 +748,6 @@ def _call_pipeline_with_fallbacks(
     except TypeError:
         pass
 
-    # Old 2-model fallback:
-    # model_a_rel -> gear_model_rel
-    # model_b_rel -> shaft_model_rel
     try:
         return run_yolo_pipeline(  # type: ignore[misc]
             img_bgr=img_bgr,
@@ -694,7 +761,6 @@ def _call_pipeline_with_fallbacks(
     except TypeError:
         pass
 
-    # Old 2-model fallback without part_type
     return run_yolo_pipeline(  # type: ignore[misc]
         img_bgr=img_bgr,
         gear_model_rel=model_a_rel,
@@ -720,9 +786,6 @@ def evaluation_function(response: Any, answer: Any, params: Params) -> Result:
         _pget(params, "return_images", pipeline_task not in ("precheck", "parts_inventory", "single_stage"))
     )
 
-    # ----------------------------
-    # New 3-model params
-    # ----------------------------
     model_a_rel = str(_pget(params, "model_a_rel", _pget(params, "gear_model_rel", "modelA.pt")))
     model_b_rel = str(_pget(params, "model_b_rel", _pget(params, "shaft_model_rel", "modelB.pt")))
     model_c_rel = str(_pget(params, "model_c_rel", "modelC.pt"))
