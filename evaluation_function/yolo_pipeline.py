@@ -75,6 +75,23 @@ SPACER_ASSIGN_AXIS_DIST_RATIO: float = 0.90
 SPACER_ASSIGN_CENTER_DIST_RATIO: float = 0.90
 SPACER_DIST_TOL_RATIO: float = 0.12
 
+# Drawing config
+BOX_THICK = 2
+CENTER_R = 4
+
+LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+LABEL_SCALE = 0.85
+LABEL_THICK = 2
+LABEL_PAD = 3
+LEADER_THICK = 2
+
+HUD_SCALE = 0.85
+HUD_THICK = 2
+HUD_LINE_GAP = 28
+HUD_X = 20
+HUD_Y0 = 30
+HUD_COLOR = (0, 255, 255)
+
 
 # -------------------------
 # Task constants
@@ -283,6 +300,283 @@ def relative_spacer_distance_tol(shafts: List[Dict[str, Any]], gears: List[Dict[
         ref = 40.0
 
     return max(5.0, SPACER_DIST_TOL_RATIO * ref)
+
+
+# =========================
+# Drawing helpers
+# =========================
+def put_text_outline(
+    img: np.ndarray,
+    text: str,
+    org: Tuple[float, float],
+    scale: float = 0.6,
+    thick: int = 2,
+    color: Tuple[int, int, int] = (0, 255, 0),
+) -> None:
+    x, y = int(org[0]), int(org[1])
+    cv2.putText(img, text, (x, y), LABEL_FONT, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), LABEL_FONT, scale, color, thick, cv2.LINE_AA)
+
+
+def draw_bbox(
+    img: np.ndarray,
+    b: Tuple[float, float, float, float],
+    color: Tuple[int, int, int],
+    thick: int = 2,
+) -> None:
+    x1, y1, x2, y2 = map(int, b)
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
+
+
+def draw_hud_lines(
+    img: np.ndarray,
+    lines: List[str],
+    x: int = HUD_X,
+    y0: int = HUD_Y0,
+    scale: float = HUD_SCALE,
+    thick: int = HUD_THICK,
+    color: Tuple[int, int, int] = HUD_COLOR,
+    line_gap: int = HUD_LINE_GAP,
+) -> None:
+    y = int(y0)
+    for s in lines:
+        put_text_outline(img, str(s), (x, y), scale=scale, thick=thick, color=color)
+        y += int(line_gap)
+
+
+def text_box_size(text: str, scale: float, thick: int) -> Tuple[int, int, int]:
+    (w, h), baseline = cv2.getTextSize(text, LABEL_FONT, scale, thick)
+    return w, h, baseline
+
+
+def rect_intersect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+
+def place_label_no_overlap(
+    img: np.ndarray,
+    text: str,
+    anchor_xy: Tuple[float, float],
+    occupied_rects: List[Tuple[int, int, int, int]],
+    color: Tuple[int, int, int] = (0, 255, 0),
+    scale: float = LABEL_SCALE,
+    thick: int = LABEL_THICK,
+    pad: int = LABEL_PAD,
+    leader: bool = True,
+) -> Tuple[Tuple[int, int], Tuple[int, int, int, int]]:
+    H, W = img.shape[:2]
+    ax, ay = int(anchor_xy[0]), int(anchor_xy[1])
+    w, h, baseline = text_box_size(text, scale, thick)
+
+    offsets = [
+        (8, -8),
+        (8, 14),
+        (-w - 8, -8),
+        (-w - 8, 14),
+        (10, -h - 10),
+        (-w - 10, -h - 10),
+        (12, 0),
+        (-w - 12, 0),
+    ]
+
+    best = None
+    best_collisions = 10**9
+
+    for dx, dy in offsets:
+        tx = ax + dx
+        ty = ay + dy
+
+        tx = max(pad, min(tx, W - w - pad))
+        ty = max(h + pad, min(ty, H - pad))
+
+        rect = (tx - pad, ty - h - pad, tx + w + pad, ty + baseline + pad)
+
+        collisions = 0
+        for r in occupied_rects:
+            if rect_intersect(rect, r):
+                collisions += 1
+
+        if collisions == 0:
+            put_text_outline(img, text, (tx, ty), scale=scale, thick=thick, color=color)
+            occupied_rects.append(rect)
+
+            if leader:
+                label_anchor = (tx, ty - h // 2)
+                dist = ((label_anchor[0] - ax) ** 2 + (label_anchor[1] - ay) ** 2) ** 0.5
+                if dist > 10:
+                    cv2.line(img, (ax, ay), label_anchor, (255, 255, 255), LEADER_THICK, cv2.LINE_AA)
+
+            return (tx, ty), rect
+
+        if collisions < best_collisions:
+            best_collisions = collisions
+            best = (tx, ty, rect)
+
+    tx, ty, rect = best
+    put_text_outline(img, text, (tx, ty), scale=scale, thick=thick, color=color)
+    occupied_rects.append(rect)
+
+    if leader:
+        label_anchor = (tx, ty - h // 2)
+        dist = ((label_anchor[0] - ax) ** 2 + (label_anchor[1] - ay) ** 2) ** 0.5
+        if dist > 10:
+            cv2.line(img, (ax, ay), label_anchor, (255, 255, 255), LEADER_THICK, cv2.LINE_AA)
+
+    return (tx, ty), rect
+
+
+def highlight_gear_by_name(
+    img: np.ndarray,
+    gears: List[Dict[str, Any]],
+    gear_names: Dict[int, str],
+    target_name: str,
+    color: Tuple[int, int, int] = (0, 0, 255),
+    thick: int = 4,
+) -> None:
+    for g in gears:
+        gid = g["gid"]
+        if gear_names.get(gid, None) == target_name:
+            draw_bbox(img, g["bbox"], color, thick)
+            cx, cy = int(g["center"][0]), int(g["center"][1])
+            cv2.circle(img, (cx, cy), CENTER_R + 2, color, -1)
+            put_text_outline(img, f"{target_name} ({g['cls']})", (cx + 12, cy - 12), 0.75, 2, color)
+            break
+
+
+def build_output_images(
+    img_bgr: np.ndarray,
+    gears: List[Dict[str, Any]],
+    spacers: List[Dict[str, Any]],
+    shaft_obbs: List[Dict[str, Any]],
+    mesh_boxes: List[Tuple[float, float, float, float]],
+    mismesh_boxes: List[Tuple[float, float, float, float]],
+    gear_names: Optional[Dict[int, str]] = None,
+    gear_stage: Optional[Dict[int, int]] = None,
+    chain_pairs: Optional[List[Tuple[int, int, float, Optional[Tuple[float, float, float, float]]]]] = None,
+    ratio: Optional[Dict[str, Any]] = None,
+    errors: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, np.ndarray]:
+    det_img = img_bgr.copy()
+    label_img = img_bgr.copy()
+
+    gear_names = gear_names or {}
+    gear_stage = gear_stage or {}
+    chain_pairs = chain_pairs or []
+    ratio = ratio or {}
+    errors = errors or []
+
+    # =========================
+    # det_img: only detection content
+    # =========================
+    for s in shaft_obbs:
+        if "poly4" in s and s["poly4"] is not None:
+            poly = np.asarray(s["poly4"], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(det_img, [poly], True, (255, 255, 255), BOX_THICK, cv2.LINE_AA)
+            put_text_outline(
+                det_img,
+                f"{s['cls']} {s['score']:.2f}",
+                (s["center"][0] + 6, s["center"][1] + 6),
+                0.55,
+                2,
+                (255, 255, 255),
+            )
+
+    for b in mesh_boxes:
+        draw_bbox(det_img, b, (255, 255, 0), 2)
+        put_text_outline(det_img, "Mesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 255, 0))
+
+    for b in mismesh_boxes:
+        draw_bbox(det_img, b, (255, 0, 255), 2)
+        put_text_outline(det_img, "Mismesh", (b[0] + 3, b[1] - 6), 0.55, 2, (255, 0, 255))
+
+    for sp in spacers:
+        draw_bbox(det_img, sp["bbox"], (0, 255, 255), 2)
+        put_text_outline(det_img, f"{sp['cls']} {sp['score']:.2f}", (sp["bbox"][0] + 3, sp["bbox"][1] - 6), 0.55, 2, (0, 255, 255))
+
+    for g in gears:
+        draw_bbox(det_img, g["bbox"], (0, 255, 0), 2)
+        put_text_outline(det_img, f"{g['cls']} {g['score']:.2f}", (g["bbox"][0] + 3, g["bbox"][1] - 6), 0.55, 2, (0, 255, 0))
+
+    # =========================
+    # label_img: reasoning visualization
+    # =========================
+    for g in gears:
+        draw_bbox(label_img, g["bbox"], (0, 120, 0), 1)
+        cx, cy = int(g["center"][0]), int(g["center"][1])
+        cv2.circle(label_img, (cx, cy), CENTER_R, (0, 0, 255), -1)
+
+    occupied: List[Tuple[int, int, int, int]] = []
+    for g in gears:
+        gid = g["gid"]
+        if gid not in gear_names:
+            continue
+        nm = gear_names[gid]
+        cx, cy = g["center"]
+        place_label_no_overlap(
+            label_img,
+            nm,
+            (cx, cy),
+            occupied,
+            color=(0, 255, 0),
+            scale=0.90,
+            thick=2,
+            leader=True,
+        )
+
+    for (gidA, gidB, hit, box) in chain_pairs:
+        try:
+            gA = gears_by_gid(gears, gidA)
+            gB = gears_by_gid(gears, gidB)
+        except StopIteration:
+            continue
+
+        p1 = (int(gA["center"][0]), int(gA["center"][1]))
+        p2 = (int(gB["center"][0]), int(gB["center"][1]))
+        cv2.line(label_img, p1, p2, (255, 255, 255), 2, cv2.LINE_AA)
+
+        mid = (int((p1[0] + p2[0]) * 0.5), int((p1[1] + p2[1]) * 0.5))
+        put_text_outline(label_img, f"contact:{hit:.2f}", (mid[0] + 6, mid[1] + 6), 0.55, 2, (255, 255, 255))
+
+    highlight_gear_by_name(label_img, gears, gear_names, "gear11", color=(0, 0, 255), thick=5)
+    highlight_gear_by_name(label_img, gears, gear_names, "gear12", color=(0, 165, 255), thick=5)
+
+    num_stages = ratio.get("num_stages", 0)
+    R_total = ratio.get("R_total", None)
+    out_rpm = ratio.get("out_rpm", None)
+    per_stage = ratio.get("per_stage", [])
+
+    hud_lines: List[str] = [
+        f"Gears detected: {len(gears)}",
+        f"Stages (computed): {num_stages}",
+    ]
+
+    if R_total is None or out_rpm is None:
+        hud_lines += [
+            "Total gear ratio (slowdown): N/A",
+            "Output shaft speed: N/A",
+        ]
+    else:
+        hud_lines += [
+            f"Total gear ratio (slowdown): {R_total:.3f}",
+            f"Output shaft speed: {out_rpm:.1f} RPM (motor={MOTOR_RPM:.0f})",
+        ]
+        for (s, R, z1, z2) in per_stage:
+            hud_lines.append(f"Stage{s}: {z2}/{z1} = {R:.2f}")
+
+    if errors:
+        hud_lines.append("---- ISSUES ----")
+        for e in errors[:8]:
+            if isinstance(e, dict):
+                hud_lines.append(str(e.get("message", "")))
+    else:
+        hud_lines.append("Issues: None")
+
+    draw_hud_lines(label_img, hud_lines)
+
+    return {
+        "det_img": det_img,
+        "label_img": label_img,
+    }
 
 
 # =========================
@@ -1181,17 +1475,46 @@ def assign_items_to_shafts(
     spacer_to_si: Dict[int, int] = {}
     si_to_spacers: Dict[int, List[int]] = {i: [] for i in range(len(shafts))}
 
+    # gears
     for g in gears:
         c = g["center"]
-        candidates = []
+
+        strict_candidates = []
         for i, s in enumerate(shafts):
             if point_in_poly(c, s["poly4_scaled"]):
-                candidates.append(i)
-        if candidates:
-            best = max(candidates, key=lambda i: shafts[i]["score"])
+                strict_candidates.append(i)
+
+        if strict_candidates:
+            best = max(strict_candidates, key=lambda i: shafts[i]["score"])
             gear_to_si[g["gid"]] = best
             si_to_gids[best].append(g["gid"])
+            continue
 
+        scored: List[Tuple[float, float, int]] = []
+        for i, s in enumerate(shafts):
+            axis_dist = dist_point_to_shaft_axis(c, s)
+            center_d = center_dist(c, s["center"])
+            scored.append((axis_dist, center_d, i))
+
+        if scored:
+            scored.sort(key=lambda x: (x[0], x[1]))
+            best_axis_dist, best_center_d, best_i = scored[0]
+            shaft = shafts[best_i]
+
+            axis_thresh = max(
+                12.0,
+                1.2 * max(float(shaft.get("minor_len", 0.0)), 1.0),
+            )
+            center_thresh = max(
+                40.0,
+                1.2 * max(float(shaft.get("major_len", 0.0)), 1.0),
+            )
+
+            if best_axis_dist <= axis_thresh and best_center_d <= center_thresh:
+                gear_to_si[g["gid"]] = best_i
+                si_to_gids[best_i].append(g["gid"])
+
+    # spacers
     for sp in spacers:
         c = sp["center"]
 
@@ -1212,25 +1535,23 @@ def assign_items_to_shafts(
             center_d = center_dist(c, s["center"])
             scored.append((axis_dist, center_d, i))
 
-        if not scored:
-            continue
+        if scored:
+            scored.sort(key=lambda x: (x[0], x[1]))
+            best_axis_dist, best_center_d, best_i = scored[0]
+            shaft = shafts[best_i]
 
-        scored.sort(key=lambda x: (x[0], x[1]))
-        best_axis_dist, best_center_d, best_i = scored[0]
-        shaft = shafts[best_i]
+            axis_thresh = max(
+                8.0,
+                SPACER_ASSIGN_AXIS_DIST_RATIO * max(float(shaft.get("minor_len", 0.0)), 1.0),
+            )
+            center_thresh = max(
+                15.0,
+                SPACER_ASSIGN_CENTER_DIST_RATIO * max(float(shaft.get("major_len", 0.0)), 1.0),
+            )
 
-        axis_thresh = max(
-            8.0,
-            SPACER_ASSIGN_AXIS_DIST_RATIO * max(float(shaft.get("minor_len", 0.0)), 1.0),
-        )
-        center_thresh = max(
-            15.0,
-            SPACER_ASSIGN_CENTER_DIST_RATIO * max(float(shaft.get("major_len", 0.0)), 1.0),
-        )
-
-        if best_axis_dist <= axis_thresh and best_center_d <= center_thresh:
-            spacer_to_si[sp["sid"]] = best_i
-            si_to_spacers[best_i].append(sp["sid"])
+            if best_axis_dist <= axis_thresh and best_center_d <= center_thresh:
+                spacer_to_si[sp["sid"]] = best_i
+                si_to_spacers[best_i].append(sp["sid"])
 
     return gear_to_si, si_to_gids, spacer_to_si, si_to_spacers
 
@@ -1338,24 +1659,46 @@ def pick_compound_on_same_shaft(
     gear_to_si: Dict[int, int],
     used_gids: set,
 ) -> Optional[int]:
-    si = gear_to_si.get(gid_base)
-    if si is None:
-        return None
-
+    si = gear_to_si.get(gid_base, None)
     g0 = gears_by_gid(gears, gid_base)
-    candidates: List[Tuple[float, int]] = []
+
+    # strict same-shaft search
+    if si is not None:
+        candidates = []
+        for g in gears:
+            gid = g["gid"]
+            if gid == gid_base or gid in used_gids:
+                continue
+            if gear_to_si.get(gid, None) != si:
+                continue
+
+            d = center_dist(g["center"], g0["center"])
+            candidates.append((d, gid))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            return candidates[0][1]
+
+    # fallback by proximity
+    fallback = []
     for g in gears:
         gid = g["gid"]
         if gid == gid_base or gid in used_gids:
             continue
-        if gear_to_si.get(gid) != si:
-            continue
-        candidates.append((center_dist(g["center"], g0["center"]), gid))
 
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
+        d = center_dist(g["center"], g0["center"])
+        r0 = float(g0.get("r", 20.0))
+        rg = float(g.get("r", 20.0))
+        dist_th = 2.4 * max(r0, rg, 20.0)
+
+        if d <= dist_th:
+            fallback.append((d, gid))
+
+    if fallback:
+        fallback.sort(key=lambda x: x[0])
+        return fallback[0][1]
+
+    return None
 
 
 def find_stage2_shaft_index_by_short_spacer(
@@ -1556,6 +1899,43 @@ def _filter_errors_by_prefix(errors: List[Dict[str, str]], prefixes: Tuple[str, 
     return out
 
 
+def _finalize_out(
+    *,
+    out: Dict[str, Any],
+    timing: Dict[str, float],
+    t0_total: float,
+    return_images: bool,
+    img_bgr: np.ndarray,
+    gears: List[Dict[str, Any]],
+    spacers: List[Dict[str, Any]],
+    shaft_obbs: List[Dict[str, Any]],
+    mesh_boxes: List[Tuple[float, float, float, float]],
+    mismesh_boxes: List[Tuple[float, float, float, float]],
+    gear_names: Optional[Dict[int, str]] = None,
+    gear_stage: Optional[Dict[int, int]] = None,
+    chain_pairs: Optional[List[Tuple[int, int, float, Optional[Tuple[float, float, float, float]]]]] = None,
+) -> Dict[str, Any]:
+    timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
+    out["timing"] = timing
+
+    if return_images:
+        out["images"] = build_output_images(
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+            gear_names=gear_names or out.get("gear_names", {}) or {},
+            gear_stage=gear_stage or out.get("gear_stage", {}) or {},
+            chain_pairs=chain_pairs or out.get("chain_pairs", []) or [],
+            ratio=out.get("ratio", {}),
+            errors=out.get("errors", []),
+        )
+
+    return out
+
+
 # =========================
 # Public API
 # =========================
@@ -1688,9 +2068,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     # --- task: precheck ---
     if task == TASK_PRECHECK:
@@ -1700,7 +2089,7 @@ def run_yolo_pipeline(
             mismesh_boxes=mismesh_boxes,
         )
 
-        out: Dict[str, Any] = {
+        out = {
             "summary": {
                 "gears": len(gears),
                 "spacers": len(spacers),
@@ -1721,9 +2110,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     # --- task: single_stage ---
     if task == TASK_SINGLE_STAGE:
@@ -1749,9 +2147,18 @@ def run_yolo_pipeline(
                 ),
                 "timing": {},
             }
-            timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-            out["timing"] = timing
-            return out
+            return _finalize_out(
+                out=out,
+                timing=timing,
+                t0_total=t0_total,
+                return_images=return_images,
+                img_bgr=img_bgr,
+                gears=gears,
+                spacers=spacers,
+                shaft_obbs=shaft_obbs,
+                mesh_boxes=mesh_boxes,
+                mismesh_boxes=mismesh_boxes,
+            )
 
         if gear11_gid is None:
             gear11_gid = pick_driving_gear(gears)["gid"]
@@ -1816,9 +2223,21 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+            gear_names=gear_names,
+            gear_stage=gear_stage,
+            chain_pairs=chain_pairs,
+        )
 
     # --- task: gear_inventory ---
     if task == TASK_GEAR_INV:
@@ -1827,7 +2246,7 @@ def run_yolo_pipeline(
             mismesh_boxes=mismesh_boxes,
         )
 
-        out: Dict[str, Any] = {
+        out = {
             "summary": {
                 "gears": len(gears),
                 "spacers": len(spacers),
@@ -1848,9 +2267,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     # --- task: shaft ---
     if task == TASK_SHAFT:
@@ -1897,9 +2325,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     # --- task: spacer ---
     if task == TASK_SPACER:
@@ -1948,9 +2385,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     # --- task: mesh_ratio / full ---
     if not gears:
@@ -1978,9 +2424,18 @@ def run_yolo_pipeline(
             ),
             "timing": {},
         }
-        timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-        out["timing"] = timing
-        return out
+        return _finalize_out(
+            out=out,
+            timing=timing,
+            t0_total=t0_total,
+            return_images=return_images,
+            img_bgr=img_bgr,
+            gears=gears,
+            spacers=spacers,
+            shaft_obbs=shaft_obbs,
+            mesh_boxes=mesh_boxes,
+            mismesh_boxes=mismesh_boxes,
+        )
 
     if gear11_gid is None:
         gear11_gid = pick_driving_gear(gears)["gid"]
@@ -2063,6 +2518,18 @@ def run_yolo_pipeline(
         "timing": {},
     }
 
-    timing["t_total_pipeline_s"] = float(time.perf_counter() - t0_total)
-    out["timing"] = timing
-    return out
+    return _finalize_out(
+        out=out,
+        timing=timing,
+        t0_total=t0_total,
+        return_images=return_images,
+        img_bgr=img_bgr,
+        gears=gears,
+        spacers=spacers,
+        shaft_obbs=shaft_obbs,
+        mesh_boxes=mesh_boxes,
+        mismesh_boxes=mismesh_boxes,
+        gear_names=gear_names,
+        gear_stage=gear_stage,
+        chain_pairs=chain_pairs,
+    )
