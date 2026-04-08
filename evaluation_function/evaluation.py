@@ -69,7 +69,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "long_missing": "The long spacer may be missing or not detected. Please check whether the long spacer is installed and retake the photo if needed.",
         "count_fail": "A spacer may be missing or not detected. Please check whether both spacers are installed and retake the photo if needed.",
         "type_confusion": "The spacer types could not be identified reliably. Please retake the photo from a clearer angle and make sure both spacers are fully visible.",
-        "assignment_fail": "The spacers were detected, but their positions could not be determined reliably. Please retake the photo from a clearer top view and make sure both spacers are fully visible.",
+        "assignment_fail": "The spacers were detected, but at least one spacer could not be reliably assigned to a shaft. Please make sure both spacers are correctly installed on the shafts and retake the photo from a clear top view.",
         "position_mismatch": "The spacer positions appear to be incorrect. Please make sure the short spacer is on the short shaft and the long spacer is on the long shaft.",
         "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to white gear than the long spacer.",
         "fail": "Please check the spacer setup again.",
