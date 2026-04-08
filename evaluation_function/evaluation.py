@@ -350,15 +350,75 @@ def _build_parts_inventory_message(out: Dict[str, Any], part_type: str) -> Tuple
     part_type = str(part_type or "").strip().lower()
 
     if part_type == "gear":
-        msg = (
-            "Detected gears:\n"
-            f"- biggear: {counts.get('biggear', 0)}\n"
-            f"- smallgear: {counts.get('smallgear', 0)}\n"
-            f"- driving gear: {counts.get('driving_gear', counts.get('drivinggear', 0))}"
+        driving_count = _safe_int(
+            counts.get("Driving_Gear", counts.get("driving_gear", counts.get("drivinggear", 0)))
         )
-        if not is_correct:
-            msg += "\nPlease spread the gears out clearly and retake the photo."
-        return is_correct, msg
+        big_count = _safe_int(
+            counts.get("Gear_big", counts.get("biggear", 0))
+        )
+        small_count = _safe_int(
+            counts.get("Gear_small", counts.get("smallgear", 0))
+        )
+        summary = out.get("summary", {}) if isinstance(out.get("summary"), dict) else {}
+        shaft_count = _safe_int(summary.get("shafts", 0))
+
+        counts_text = (
+            f"Driving gear: {driving_count}\n"
+            f"Big gears: {big_count}\n"
+            f"Small gears: {small_count}"
+        )
+
+        if shaft_count > 0:
+            feedback = (
+                "The image contains shafts, which are not required for this task. "
+                "Please remove the shafts and any attached gear assemblies (e.g. orange gears) "
+                "and upload a photo showing only the gears."
+            )
+            return False, f"{counts_text}\n{feedback}"
+
+        if driving_count == 0:
+            feedback = (
+                "No driving gear was detected. Please include the white driving gear clearly in the photo."
+            )
+            return False, f"{counts_text}\n{feedback}"
+
+        if driving_count > 1:
+            feedback = (
+                "More than one driving gear was detected. Please upload an image containing only one white driving gear."
+            )
+            return False, f"{counts_text}\n{feedback}"
+
+        if big_count != small_count:
+            feedback = (
+                "The detected green idler gears are incomplete or unclear. "
+                "Each green idler gear unit should contain one big gear and one small gear. "
+                "Please retake a clearer photo."
+            )
+            return False, f"{counts_text}\n{feedback}"
+
+        idler_units = big_count
+
+        if idler_units == 2:
+            feedback = (
+                "Good. You have met the task requirement. "
+                "Detected counts: 1 driving gear and 2 green idler gear units."
+            )
+            return True, f"{counts_text}\n{feedback}"
+
+        if idler_units < 2:
+            feedback = (
+                "Not enough green idler gear units were detected. "
+                "This task requires two green idler gear units. "
+                "Please include both units clearly in the photo."
+            )
+            return False, f"{counts_text}\n{feedback}"
+
+        feedback = (
+            "Too many green idler gear units were detected. "
+            "This task requires exactly two green idler gear units. "
+            "Please remove the extra gears and upload a new photo."
+        )
+        return False, f"{counts_text}\n{feedback}"
 
     if part_type == "shaft":
         msg = (
