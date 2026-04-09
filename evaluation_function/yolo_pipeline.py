@@ -717,26 +717,15 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, float]:
     brightness_mean = float(np.mean(gray))
     contrast_std = float(np.std(gray))
     sharpness_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-    h, w = gray.shape
-    block_means: List[float] = []
-    for r in range(4):
-        for c in range(4):
-            y0 = int(r * h / 4)
-            y1 = int((r + 1) * h / 4)
-            x0 = int(c * w / 4)
-            x1 = int((c + 1) * w / 4)
-            patch = gray[y0:y1, x0:x1]
-            if patch.size > 0:
-                block_means.append(float(np.mean(patch)))
-
-    illumination_nonuniformity = float(np.std(block_means)) if block_means else 0.0
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    noise_residual = gray.astype(np.float32) - blur.astype(np.float32)
+    noise_score = float(np.std(noise_residual))
 
     return {
         "brightness_mean": brightness_mean,
         "contrast_std": contrast_std,
         "sharpness_score": sharpness_score,
-        "illumination_nonuniformity": illumination_nonuniformity,
+        "noise_score": noise_score,
     }
 
 

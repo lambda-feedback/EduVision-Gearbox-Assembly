@@ -41,7 +41,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "- brightness: {brightness_mean}\n"
             "- contrast: {contrast_std}\n"
             "- sharpness: {sharpness_score}\n"
-            "- lighting uniformity: {illumination_nonuniformity}\n"
+            "- noise: {noise_score}\n"
             "These values are provided as reference only and do not determine whether the assembly is correct."
         ),
     },
@@ -532,7 +532,7 @@ def _build_student_message(
             brightness_mean=qfmt("brightness_mean"),
             contrast_std=qfmt("contrast_std"),
             sharpness_score=qfmt("sharpness_score"),
-            illumination_nonuniformity=qfmt("illumination_nonuniformity"),
+            noise_score=qfmt("noise_score"),
         )
 
     if task == "single_stage":
