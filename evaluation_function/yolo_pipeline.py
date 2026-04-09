@@ -711,25 +711,33 @@ def get_spacer_counts(spacers: List[Dict[str, Any]]) -> Dict[str, int]:
 # =========================
 # Precheck helpers
 # =========================
-def evaluate_precheck_consistency(
-    gears: List[Dict[str, Any]],
-    mesh_boxes: List[Tuple[float, float, float, float]],
-    mismesh_boxes: List[Tuple[float, float, float, float]],
-) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
-    errs: List[Dict[str, str]] = []
+def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, float]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    counts = get_gear_counts(gears)
+    brightness_mean = float(np.mean(gray))
+    contrast_std = float(np.std(gray))
+    sharpness_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    if counts["biggear"] != counts["smallgear"]:
-        errs.append({
-            "code": "E_PRECHECK_BIG_SMALL_INCONSISTENT",
-            "message": (
-                f"Precheck failed: biggear={counts['biggear']} and smallgear={counts['smallgear']} "
-                f"are not consistent."
-            ),
-        })
+    h, w = gray.shape
+    block_means: List[float] = []
+    for r in range(4):
+        for c in range(4):
+            y0 = int(r * h / 4)
+            y1 = int((r + 1) * h / 4)
+            x0 = int(c * w / 4)
+            x1 = int((c + 1) * w / 4)
+            patch = gray[y0:y1, x0:x1]
+            if patch.size > 0:
+                block_means.append(float(np.mean(patch)))
 
-    return errs, counts
+    illumination_nonuniformity = float(np.std(block_means)) if block_means else 0.0
+
+    return {
+        "brightness_mean": brightness_mean,
+        "contrast_std": contrast_std,
+        "sharpness_score": sharpness_score,
+        "illumination_nonuniformity": illumination_nonuniformity,
+    }
 
 
 # =========================
@@ -838,6 +846,15 @@ def evaluate_gear_inventory_step(
             "message": "No gears detected.",
         })
         return errs, counts
+
+    if counts["biggear"] != counts["smallgear"]:
+        errs.append({
+            "code": "E_GEAR_BIG_SMALL_INCONSISTENT",
+            "message": (
+                f"Gear inventory check failed: biggear={counts['biggear']} and "
+                f"smallgear={counts['smallgear']} are not consistent."
+            ),
+        })
 
     total_contact = len(mesh_boxes) + len(mismesh_boxes)
     gear_count = len(gears)
@@ -2095,11 +2112,9 @@ def run_yolo_pipeline(
 
     # --- task: precheck ---
     if task == TASK_PRECHECK:
-        errors, counts = evaluate_precheck_consistency(
-            gears=gears,
-            mesh_boxes=mesh_boxes,
-            mismesh_boxes=mismesh_boxes,
-        )
+        quality = compute_image_quality_metrics(img_bgr)
+        counts = get_gear_counts(gears)
+        errors: List[Dict[str, Any]] = []
 
         out = {
             "summary": {
@@ -2111,13 +2126,14 @@ def run_yolo_pipeline(
                 "stages": 0,
             },
             "counts": counts,
+            "quality": quality,
             "errors": errors,
             "ratio": {"num_stages": 0, "R_total": None, "out_rpm": None, "per_stage": []},
             "cold_start": bool(is_cold_start),
             "task_result": _task_result(
                 TASK_PRECHECK,
                 errors,
-                focus=["precheck"],
+                focus=["photo_quality"],
                 next_task=TASK_SINGLE_STAGE,
             ),
             "timing": {},

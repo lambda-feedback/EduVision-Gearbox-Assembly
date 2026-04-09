@@ -36,16 +36,14 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "fail": "Some parts could not be detected clearly. Please separate the parts and retake the photo.",
     },
     "precheck": {
-        "pass": "Good. The detected setup is consistent. You can proceed.",
-        "count_rule_fail": (
-            "The detected numbers of gears and gear-contact regions are not consistent. "
-            "Please make sure all gears and contact regions are clearly visible, then retake the photo."
+        "report": (
+            "Photo quality reference values:\n"
+            "- brightness: {brightness_mean}\n"
+            "- contrast: {contrast_std}\n"
+            "- sharpness: {sharpness_score}\n"
+            "- lighting uniformity: {illumination_nonuniformity}\n"
+            "These values are provided as reference only and do not determine whether the assembly is correct."
         ),
-        "big_small_inconsistent": (
-            "The detected numbers of big gears and small gears are not consistent. "
-            "Please make sure all gears are clearly visible, then retake the photo."
-        ),
-        "fail": "Please retake the photo. The detected setup is not consistent enough for reliable checking.",
     },
     "single_stage": {
         "pass": (
@@ -125,9 +123,17 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "- driving gear: {driving_gear}\n"
             "- small gear: {smallgear}\n"
             "- big gear: {biggear}\n"
-            "The detected gears and contact regions are not consistent enough for reliable checking. "
-            "Please make sure only the intended gears are visible, that meshing areas can be seen clearly, "
-            "and then retake the photo."
+            "The system cannot reliably evaluate the gear meshing due to unclear or inconsistent detection results. "
+            "Please ensure that only the required gears are visible in the image, and that the gear meshing areas "
+            "are clearly shown before retaking the photo."
+        ),
+        "big_small_inconsistent": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "The detected numbers of big gears and small gears are not consistent. "
+            "Please check the gear setup and retake the photo."
         ),
         "mismatch_fail": (
             "Detected gears:\n"
@@ -299,6 +305,7 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
                 "E_NO_GEARS",
                 "E_MESH_MISMATCH",
                 "E_GEAR_CONTACT_INCONSISTENT",
+                "E_GEAR_BIG_SMALL_INCONSISTENT",
             }
 
         if task == "mesh_ratio":
@@ -513,25 +520,20 @@ def _build_student_message(
     task_has_error = _has_selected_pipeline_error(selected_errors)
 
     if task == "precheck":
-        codes = {
-            str(e.get("code", "")).upper()
-            for e in selected_errors
-            if isinstance(e, dict)
-        }
+        quality = out.get("quality", {}) if isinstance(out.get("quality"), dict) else {}
 
-        if "E_NO_GEARS" in codes:
-            return False, MESSAGE_POLICY["precheck"]["fail"]
+        def qfmt(key: str) -> str:
+            try:
+                return f"{float(quality.get(key, 0.0)):.2f}"
+            except Exception:
+                return str(quality.get(key, "N/A"))
 
-        if "E_PRECHECK_BIG_SMALL_INCONSISTENT" in codes:
-            return False, MESSAGE_POLICY["precheck"]["big_small_inconsistent"]
-
-        if "E_PRECHECK_COUNT_RULE_FAIL" in codes:
-            return False, MESSAGE_POLICY["precheck"]["count_rule_fail"]
-
-        if task_has_error:
-            return False, MESSAGE_POLICY["precheck"]["fail"]
-
-        return True, MESSAGE_POLICY["precheck"]["pass"]
+        return True, MESSAGE_POLICY["precheck"]["report"].format(
+            brightness_mean=qfmt("brightness_mean"),
+            contrast_std=qfmt("contrast_std"),
+            sharpness_score=qfmt("sharpness_score"),
+            illumination_nonuniformity=qfmt("illumination_nonuniformity"),
+        )
 
     if task == "single_stage":
         codes = {
@@ -716,6 +718,13 @@ def _build_student_message(
 
         if "E_MESH_MISMATCH" in codes:
             return False, MESSAGE_POLICY["gear_inventory"]["mismatch_fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if "E_GEAR_BIG_SMALL_INCONSISTENT" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["big_small_inconsistent"].format(
                 driving_gear=driving_gear,
                 smallgear=smallgear,
                 biggear=biggear,
