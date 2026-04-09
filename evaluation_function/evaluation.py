@@ -120,6 +120,15 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "- big gear: {biggear}\n"
             "Good. No obvious gear mismatch was detected."
         ),
+        "contact_consistency_fail": (
+            "Detected gears:\n"
+            "- driving gear: {driving_gear}\n"
+            "- small gear: {smallgear}\n"
+            "- big gear: {biggear}\n"
+            "The detected gears and contact regions are not consistent enough for reliable checking. "
+            "Please make sure only the intended gears are visible, that meshing areas can be seen clearly, "
+            "and then retake the photo."
+        ),
         "mismatch_fail": (
             "Detected gears:\n"
             "- driving gear: {driving_gear}\n"
@@ -258,7 +267,6 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
 
         if task == "precheck":
             return code in {
-                "E_PRECHECK_COUNT_RULE_FAIL",
                 "E_PRECHECK_BIG_SMALL_INCONSISTENT",
                 "E_NO_GEARS",
             }
@@ -290,6 +298,7 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
             return code in {
                 "E_NO_GEARS",
                 "E_MESH_MISMATCH",
+                "E_GEAR_CONTACT_INCONSISTENT",
             }
 
         if task == "mesh_ratio":
@@ -707,6 +716,13 @@ def _build_student_message(
 
         if "E_MESH_MISMATCH" in codes:
             return False, MESSAGE_POLICY["gear_inventory"]["mismatch_fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if "E_GEAR_CONTACT_INCONSISTENT" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["contact_consistency_fail"].format(
                 driving_gear=driving_gear,
                 smallgear=smallgear,
                 biggear=biggear,

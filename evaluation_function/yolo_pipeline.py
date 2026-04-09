@@ -719,27 +719,6 @@ def evaluate_precheck_consistency(
     errs: List[Dict[str, str]] = []
 
     counts = get_gear_counts(gears)
-    total_contact = len(mesh_boxes) + len(mismesh_boxes)
-    gear_count = len(gears)
-
-    expected_contact, ok = expected_contact_boxes_from_gear_count(gear_count)
-
-    if (not ok) or (expected_contact is None):
-        errs.append({
-            "code": "E_PRECHECK_COUNT_RULE_FAIL",
-            "message": (
-                f"Precheck failed: detected gear_count={gear_count}, which does not fit "
-                f"the expected contact rule."
-            ),
-        })
-    elif total_contact != expected_contact:
-        errs.append({
-            "code": "E_PRECHECK_COUNT_RULE_FAIL",
-            "message": (
-                f"Precheck failed: mesh+mismesh={total_contact}, expected={expected_contact} "
-                f"for gear_count={gear_count}."
-            ),
-        })
 
     if counts["biggear"] != counts["smallgear"]:
         errs.append({
@@ -847,6 +826,7 @@ def evaluate_parts_inventory(
 # =========================
 def evaluate_gear_inventory_step(
     gears: List[Dict[str, Any]],
+    mesh_boxes: List[Tuple[float, float, float, float]],
     mismesh_boxes: List[Tuple[float, float, float, float]],
 ) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
     errs: List[Dict[str, str]] = []
@@ -858,6 +838,18 @@ def evaluate_gear_inventory_step(
             "message": "No gears detected.",
         })
         return errs, counts
+
+    total_contact = len(mesh_boxes) + len(mismesh_boxes)
+    gear_count = len(gears)
+    expected_contact, ok = expected_contact_boxes_from_gear_count(gear_count)
+    if (not ok) or (expected_contact is None) or (total_contact != expected_contact):
+        errs.append({
+            "code": "E_GEAR_CONTACT_INCONSISTENT",
+            "message": (
+                f"Gear inventory consistency check failed: mesh+mismesh={total_contact}, "
+                f"expected={expected_contact} for gear_count={gear_count}."
+            ),
+        })
 
     if len(mismesh_boxes) > 0:
         errs.append({
@@ -2286,6 +2278,7 @@ def run_yolo_pipeline(
     if task == TASK_GEAR_INV:
         errors, counts = evaluate_gear_inventory_step(
             gears=gears,
+            mesh_boxes=mesh_boxes,
             mismesh_boxes=mismesh_boxes,
         )
 
