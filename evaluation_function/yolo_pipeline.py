@@ -883,7 +883,7 @@ def evaluate_single_stage_errors(
     driving_cnt = sum(1 for g in gears if str(g["cls"]) in DRIVING_GEAR_CLASS_NAMES)
     big_cnt = sum(1 for g in gears if str(g["cls"]) == GEAR_BIG_NAME)
     small_cnt = sum(1 for g in gears if str(g["cls"]) == GEAR_SMALL_NAME)
-    short_spacer_cnt = sum(1 for sp in spacers if spacer_is_short(sp))
+    spacer_cnt = len(spacers)
     shaft_cnt = len(shafts)
 
     if driving_cnt != 1:
@@ -892,10 +892,10 @@ def evaluate_single_stage_errors(
             "message": f"Expected 1 driving gear, but detected {driving_cnt}.",
         })
 
-    if short_spacer_cnt != 1:
+    if spacer_cnt != 1:
         errs.append({
-            "code": "E_SINGLE_STAGE_SHORT_SPACER",
-            "message": f"Expected 1 short spacer, but detected {short_spacer_cnt}.",
+            "code": "E_SINGLE_STAGE_SPACER_COUNT",
+            "message": f"Expected 1 spacer, but detected {spacer_cnt}.",
         })
 
     if small_cnt != 1:
@@ -2219,6 +2219,25 @@ def run_yolo_pipeline(
             mismesh_boxes=mismesh_boxes,
             ratio=ratio,
         )
+        spacer_counts = get_spacer_counts(spacers)
+        shaft_counts = get_shaft_counts(shaft_obbs)
+        single_stage_hints: List[str] = []
+        if (
+            spacer_counts.get("spacer_long", 0) == 1
+            and spacer_counts.get("spacer_short", 0) == 0
+        ):
+            single_stage_hints.append(
+                "The setup works, but think about whether a short spacer or a long spacer "
+                "is more appropriate here."
+            )
+        if (
+            shaft_counts.get("shaft_short", 0) == 1
+            and shaft_counts.get("shaft_long", 0) == 0
+        ):
+            single_stage_hints.append(
+                "The setup works, but think about whether a long shaft or a short shaft "
+                "is the better choice here."
+            )
 
         out = {
             "summary": {
@@ -2230,11 +2249,14 @@ def run_yolo_pipeline(
                 "stages": num_stages,
             },
             "counts": get_gear_counts(gears),
+            "shaft_counts": shaft_counts,
+            "spacer_counts": spacer_counts,
             "gear_names": gear_names,
             "gear_stage": gear_stage,
             "chain_pairs": chain_pairs,
             "ratio": ratio,
             "errors": errors,
+            "single_stage_hints": single_stage_hints,
             "cold_start": bool(is_cold_start),
             "task_result": _task_result(
                 TASK_SINGLE_STAGE,

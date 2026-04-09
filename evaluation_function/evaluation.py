@@ -54,6 +54,44 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "Gear ratio: {R_total}\n"
             "Output speed: {out_rpm} RPM"
         ),
+        "no_gears": (
+            "No gears were detected clearly. Please make sure the gears are installed correctly "
+            "and clearly visible in the photo."
+        ),
+        "gear_missing": (
+            "Some gears may be missing or not clearly visible. Please check the gear setup and "
+            "retake the photo from a clearer angle."
+        ),
+        "gear_overloaded": (
+            "The gear setup seems to contain extra gears. Please try reducing the number of gears, "
+            "and remove any gears that are not being used or are not part of the assembly from the photo."
+        ),
+        "no_spacer": (
+            "No spacer was detected. Please make sure the spacer is installed correctly and clearly visible in the photo."
+        ),
+        "extra_spacer": (
+            "Too many spacers were detected. Please remove any spacer that is not needed from the assembly or from the photo."
+        ),
+        "no_shaft": (
+            "No shaft was detected. Please make sure the shaft is installed correctly and clearly visible in the photo."
+        ),
+        "extra_shaft": (
+            "Too many shafts were detected. Please remove any shaft that is not needed from the assembly or from the photo."
+        ),
+        "mismesh": (
+            "The gears do not appear to mesh correctly. Please check the gear engagement and remove any gear "
+            "that is not properly participating in the transmission."
+        ),
+        "stage_fail": (
+            "A clear single-stage transmission could not be confirmed. Please simplify the setup and "
+            "make sure only the intended transmission parts are visible."
+        ),
+        "hint_long_spacer": (
+            "The setup works, but think about whether a short spacer or a long spacer is more appropriate here."
+        ),
+        "hint_short_shaft": (
+            "The setup works, but think about whether a long shaft or a short shaft is the better choice here."
+        ),
         "fail": "Please check the single-stage setup again. A valid one-stage transmission could not be confirmed.",
     },
     "shaft": {
@@ -323,7 +361,7 @@ def _get_gear_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
 
 
 def _get_shaft_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
-    counts = _get_counts_dict(out)
+    counts = out.get("shaft_counts", {}) if isinstance(out.get("shaft_counts"), dict) else {}
 
     n_long = _safe_int(counts.get("shaft_long", 0))
     n_short = _safe_int(counts.get("shaft_short", 0))
@@ -333,7 +371,7 @@ def _get_shaft_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
 
 
 def _get_spacer_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
-    counts = _get_counts_dict(out)
+    counts = out.get("spacer_counts", {}) if isinstance(out.get("spacer_counts"), dict) else {}
 
     n_long = _safe_int(counts.get("spacer_long", 0))
     n_short = _safe_int(counts.get("spacer_short", 0))
@@ -487,6 +525,51 @@ def _build_student_message(
         return True, MESSAGE_POLICY["precheck"]["pass"]
 
     if task == "single_stage":
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
+        driving_gear, smallgear, biggear = _get_gear_counts(out)
+        shaft_long, shaft_short, shaft_total = _get_shaft_counts(out)
+        spacer_long, spacer_short, spacer_total = _get_spacer_counts(out)
+
+        if "E_NO_GEARS" in codes:
+            return False, MESSAGE_POLICY["single_stage"]["no_gears"]
+
+        if "E_SINGLE_STAGE_SHAFT" in codes:
+            if shaft_total <= 0:
+                return False, MESSAGE_POLICY["single_stage"]["no_shaft"]
+            if shaft_total > 1:
+                return False, MESSAGE_POLICY["single_stage"]["extra_shaft"]
+
+        if "E_SINGLE_STAGE_SPACER_COUNT" in codes:
+            if spacer_total <= 0:
+                return False, MESSAGE_POLICY["single_stage"]["no_spacer"]
+            if spacer_total > 1:
+                return False, MESSAGE_POLICY["single_stage"]["extra_spacer"]
+
+        if "E_SINGLE_STAGE_MISMESH" in codes:
+            return False, MESSAGE_POLICY["single_stage"]["mismesh"]
+
+        gear_codes = {
+            "E_SINGLE_STAGE_DRIVING_GEAR",
+            "E_SINGLE_STAGE_SMALL_GEAR",
+            "E_SINGLE_STAGE_BIG_GEAR",
+        }
+        if codes & gear_codes:
+            if (
+                driving_gear > 1
+                or smallgear > 1
+                or biggear > 1
+                or biggear != smallgear
+            ):
+                return False, MESSAGE_POLICY["single_stage"]["gear_overloaded"]
+            return False, MESSAGE_POLICY["single_stage"]["gear_missing"]
+
+        if "E_SINGLE_STAGE_STAGE_COUNT" in codes or "E_SINGLE_STAGE_RATIO" in codes:
+            return False, MESSAGE_POLICY["single_stage"]["stage_fail"]
+
         is_correct = not _has_pipeline_error(errors)
         if not is_correct:
             return False, MESSAGE_POLICY["single_stage"]["fail"]
@@ -499,11 +582,17 @@ def _build_student_message(
         if num_stages is None or r_total is None or out_rpm is None:
             return False, MESSAGE_POLICY["single_stage"]["fail"]
 
-        return True, MESSAGE_POLICY["single_stage"]["pass"].format(
+        msg = MESSAGE_POLICY["single_stage"]["pass"].format(
             num_stages=_format_stage_value(num_stages),
             R_total=_format_ratio_value(r_total),
             out_rpm=_format_rpm_value(out_rpm),
         )
+        hints = out.get("single_stage_hints", [])
+        if isinstance(hints, list):
+            cleaned = [str(h).strip() for h in hints if str(h).strip()]
+            if cleaned:
+                msg = f"{msg}\n" + "\n".join(cleaned)
+        return True, msg
 
     if task == "shaft":
         codes = {
