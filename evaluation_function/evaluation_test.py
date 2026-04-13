@@ -2,8 +2,11 @@ import os
 import unittest
 from pathlib import Path
 
+import cv2
+import numpy as np
 from lf_toolkit.evaluation import Params
 from .evaluation import evaluation_function
+from .yolo_pipeline import compute_image_quality_metrics
 
 
 def _as_file_uri(path: str) -> str:
@@ -112,6 +115,31 @@ class TestEvaluationFunction(unittest.TestCase):
 
         fb_text = _feedback_as_text(fb)
         self.assertIn("could not be loaded", fb_text.lower())
+
+    def test_image_quality_score_uses_student_friendly_threshold(self):
+        sharp = np.zeros((120, 120, 3), dtype=np.uint8)
+        sharp[:, :60] = 30
+        sharp[:, 60:] = 230
+        cv2.line(sharp, (0, 0), (119, 119), (255, 255, 255), 3)
+
+        blurry = np.full((120, 120, 3), 120, dtype=np.uint8)
+        blurry = cv2.GaussianBlur(blurry, (31, 31), 0)
+
+        sharp_quality = compute_image_quality_metrics(sharp)
+        blurry_quality = compute_image_quality_metrics(blurry)
+
+        self.assertIn("quality_score", sharp_quality)
+        self.assertIn("quality_accept_score", sharp_quality)
+        self.assertEqual(sharp_quality["quality_score_max"], 100)
+        self.assertIn("quality_advice", sharp_quality)
+        self.assertGreaterEqual(
+            sharp_quality["quality_score"],
+            sharp_quality["quality_accept_score"],
+        )
+        self.assertLess(
+            blurry_quality["quality_score"],
+            blurry_quality["quality_accept_score"],
+        )
 
 
 if __name__ == "__main__":

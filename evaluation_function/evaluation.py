@@ -37,12 +37,20 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     },
     "precheck": {
         "report": (
-            "Photo quality reference values:\n"
-            "- brightness: {brightness_mean}\n"
-            "- contrast: {contrast_std}\n"
-            "- sharpness: {sharpness_score}\n"
-            "- noise: {noise_score}\n"
-            "These values are provided as reference only and do not determine whether the assembly is correct."
+            "Photo quality score: {quality_score}/100.\n"
+            "Brightness: {brightness_score}/100\n"
+            "Contrast: {contrast_score}/100\n"
+            "Sharpness: {sharpness_score}/100\n"
+            "Noise control: {noise_score}/100\n"
+            "{quality_advice}"
+        ),
+        "fail": (
+            "Photo quality score: {quality_score}/100.\n"
+            "Brightness: {brightness_score}/100\n"
+            "Contrast: {contrast_score}/100\n"
+            "Sharpness: {sharpness_score}/100\n"
+            "Noise control: {noise_score}/100\n"
+            "{quality_advice}"
         ),
     },
     "single_stage": {
@@ -274,6 +282,7 @@ def _select_errors_by_task(errors: List[Dict[str, Any]], task: str) -> List[Dict
         if task == "precheck":
             return code in {
                 "E_PRECHECK_BIG_SMALL_INCONSISTENT",
+                "E_PHOTO_QUALITY_LOW",
                 "E_NO_GEARS",
             }
 
@@ -521,18 +530,36 @@ def _build_student_message(
 
     if task == "precheck":
         quality = out.get("quality", {}) if isinstance(out.get("quality"), dict) else {}
+        codes = {
+            str(e.get("code", "")).upper()
+            for e in selected_errors
+            if isinstance(e, dict)
+        }
 
-        def qfmt(key: str) -> str:
+        def qint(key: str, default: int = 0) -> str:
             try:
-                return f"{float(quality.get(key, 0.0)):.2f}"
+                return str(int(round(float(quality.get(key, default)))))
             except Exception:
-                return str(quality.get(key, "N/A"))
+                return str(default)
 
-        return True, MESSAGE_POLICY["precheck"]["report"].format(
-            brightness_mean=qfmt("brightness_mean"),
-            contrast_std=qfmt("contrast_std"),
-            sharpness_score=qfmt("sharpness_score"),
-            noise_score=qfmt("noise_score"),
+        def advice_text() -> str:
+            advice = quality.get("quality_advice", [])
+            if isinstance(advice, list):
+                clean = [str(item).strip() for item in advice if str(item).strip()]
+            else:
+                clean = [str(advice).strip()] if str(advice).strip() else []
+            if not clean:
+                clean = ["The photo is clear enough for the next check."]
+            return "\n".join(f"- {item}" for item in clean[:3])
+
+        policy_key = "fail" if ("E_PHOTO_QUALITY_LOW" in codes or task_has_error) else "report"
+        return policy_key == "report", MESSAGE_POLICY["precheck"][policy_key].format(
+            quality_score=qint("quality_score"),
+            brightness_score=qint("brightness_score"),
+            contrast_score=qint("contrast_score"),
+            sharpness_score=qint("sharpness_score_100"),
+            noise_score=qint("noise_score_100"),
+            quality_advice=advice_text(),
         )
 
     if task == "single_stage":

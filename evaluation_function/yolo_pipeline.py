@@ -66,6 +66,21 @@ NORM_GAP: float = 200.0
 
 ENABLE_ERROR_CHECKS: bool = True
 
+# Image-quality precheck thresholds. Scores are normalized to 0-100 for display.
+# The fail threshold is intentionally permissive so borderline usable photos are
+# not rejected while obviously dark/blurry/noisy ones are sent back for retake.
+QUALITY_ACCEPT_SCORE: int = int(os.environ.get("QUALITY_ACCEPT_SCORE", "40"))
+QUALITY_BRIGHTNESS_USABLE_MIN: float = 35.0
+QUALITY_BRIGHTNESS_IDEAL_MIN: float = 60.0
+QUALITY_BRIGHTNESS_IDEAL_MAX: float = 210.0
+QUALITY_BRIGHTNESS_USABLE_MAX: float = 235.0
+QUALITY_CONTRAST_USABLE_MIN: float = 10.0
+QUALITY_CONTRAST_IDEAL_MIN: float = 25.0
+QUALITY_SHARPNESS_USABLE_MIN: float = 40.0
+QUALITY_SHARPNESS_IDEAL_MIN: float = 250.0
+QUALITY_NOISE_IDEAL_MAX: float = 12.0
+QUALITY_NOISE_USABLE_MAX: float = 35.0
+
 # Geometry / ambiguity thresholds
 SHAFT_DISTANCE_AMBIG_RATIO: float = 0.08
 SPACER_ASSIGN_AXIS_DIST_RATIO: float = 0.90
@@ -711,7 +726,74 @@ def get_spacer_counts(spacers: List[Dict[str, Any]]) -> Dict[str, int]:
 # =========================
 # Precheck helpers
 # =========================
-def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, float]:
+def _clip01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _score_band(value: float, usable_min: float, ideal_min: float, ideal_max: float, usable_max: float) -> float:
+    if ideal_min <= value <= ideal_max:
+        return 1.0
+    if usable_min <= value < ideal_min:
+        return _clip01((value - usable_min) / (ideal_min - usable_min))
+    if ideal_max < value <= usable_max:
+        return _clip01((usable_max - value) / (usable_max - ideal_max))
+    return 0.0
+
+
+def _score_min(value: float, usable_min: float, ideal_min: float) -> float:
+    if value >= ideal_min:
+        return 1.0
+    if value <= usable_min:
+        return 0.0
+    return _clip01((value - usable_min) / (ideal_min - usable_min))
+
+
+def _score_max(value: float, ideal_max: float, usable_max: float) -> float:
+    if value <= ideal_max:
+        return 1.0
+    if value >= usable_max:
+        return 0.0
+    return _clip01((usable_max - value) / (usable_max - ideal_max))
+
+
+def _score100(component: float) -> int:
+    return int(round(100.0 * _clip01(component)))
+
+
+def _quality_advice(
+    *,
+    brightness_mean: float,
+    contrast_component: float,
+    sharpness_component: float,
+    noise_component: float,
+) -> List[str]:
+    advice: List[str] = []
+
+    if brightness_mean < QUALITY_BRIGHTNESS_USABLE_MIN:
+        advice.append("The photo is too dark. Retake it in brighter light.")
+    elif brightness_mean < QUALITY_BRIGHTNESS_IDEAL_MIN:
+        advice.append("The photo is a little dark. Add more light if possible.")
+    elif brightness_mean > QUALITY_BRIGHTNESS_USABLE_MAX:
+        advice.append("The photo is overexposed. Reduce glare or strong direct light.")
+    elif brightness_mean > QUALITY_BRIGHTNESS_IDEAL_MAX:
+        advice.append("The photo is a little bright. Try reducing glare.")
+
+    if contrast_component < 0.5:
+        advice.append("The parts do not stand out clearly. Use a plain background and avoid shadows.")
+
+    if sharpness_component < 0.5:
+        advice.append("The photo is blurry. Hold the camera still and refocus before taking the photo.")
+
+    if noise_component < 0.5:
+        advice.append("The photo looks noisy or grainy. Use better lighting and avoid digital zoom.")
+
+    if not advice:
+        advice.append("The photo is clear enough for the next check.")
+
+    return advice
+
+
+def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
     brightness_mean = float(np.mean(gray))
@@ -721,11 +803,57 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, float]:
     noise_residual = gray.astype(np.float32) - blur.astype(np.float32)
     noise_score = float(np.std(noise_residual))
 
+    brightness_component = _score_band(
+        brightness_mean,
+        QUALITY_BRIGHTNESS_USABLE_MIN,
+        QUALITY_BRIGHTNESS_IDEAL_MIN,
+        QUALITY_BRIGHTNESS_IDEAL_MAX,
+        QUALITY_BRIGHTNESS_USABLE_MAX,
+    )
+    contrast_component = _score_min(
+        contrast_std,
+        QUALITY_CONTRAST_USABLE_MIN,
+        QUALITY_CONTRAST_IDEAL_MIN,
+    )
+    sharpness_component = _score_min(
+        sharpness_score,
+        QUALITY_SHARPNESS_USABLE_MIN,
+        QUALITY_SHARPNESS_IDEAL_MIN,
+    )
+    noise_component = _score_max(
+        noise_score,
+        QUALITY_NOISE_IDEAL_MAX,
+        QUALITY_NOISE_USABLE_MAX,
+    )
+    quality_score = int(round(100.0 * (
+        0.25 * brightness_component
+        + 0.20 * contrast_component
+        + 0.40 * sharpness_component
+        + 0.15 * noise_component
+    )))
+    if contrast_component <= 0.0 and sharpness_component <= 0.0:
+        quality_score = min(quality_score, QUALITY_ACCEPT_SCORE - 1)
+    advice = _quality_advice(
+        brightness_mean=brightness_mean,
+        contrast_component=contrast_component,
+        sharpness_component=sharpness_component,
+        noise_component=noise_component,
+    )
+
     return {
         "brightness_mean": brightness_mean,
         "contrast_std": contrast_std,
         "sharpness_score": sharpness_score,
         "noise_score": noise_score,
+        "brightness_score": _score100(brightness_component),
+        "contrast_score": _score100(contrast_component),
+        "sharpness_score_100": _score100(sharpness_component),
+        "noise_score_100": _score100(noise_component),
+        "quality_score": quality_score,
+        "quality_score_max": 100,
+        "quality_accept_score": QUALITY_ACCEPT_SCORE,
+        "quality_pass": quality_score >= QUALITY_ACCEPT_SCORE,
+        "quality_advice": advice,
     }
 
 
@@ -2104,6 +2232,14 @@ def run_yolo_pipeline(
         quality = compute_image_quality_metrics(img_bgr)
         counts = get_gear_counts(gears)
         errors: List[Dict[str, Any]] = []
+        if not bool(quality.get("quality_pass", True)):
+            errors.append({
+                "code": "E_PHOTO_QUALITY_LOW",
+                "message": (
+                    "The photo quality is too low for reliable checking. "
+                    "Please retake it with clearer focus and better lighting."
+                ),
+            })
 
         out = {
             "summary": {
