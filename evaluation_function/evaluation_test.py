@@ -141,6 +141,22 @@ class TestEvaluationFunction(unittest.TestCase):
             blurry_quality["quality_accept_score"],
         )
 
+    def test_image_quality_rejects_low_single_component_score(self):
+        gradient = np.tile(np.linspace(30, 230, 160, dtype=np.uint8), (120, 1))
+        image = cv2.cvtColor(gradient, cv2.COLOR_GRAY2BGR)
+
+        quality = compute_image_quality_metrics(image)
+
+        self.assertGreaterEqual(
+            quality["quality_score"],
+            quality["quality_accept_score"],
+        )
+        self.assertLessEqual(
+            quality["sharpness_score_100"],
+            quality["quality_min_component_score"],
+        )
+        self.assertFalse(quality["quality_pass"])
+
 
 if __name__ == "__main__":
     unittest.main()

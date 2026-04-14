@@ -70,6 +70,7 @@ ENABLE_ERROR_CHECKS: bool = True
 # The fail threshold is intentionally permissive so borderline usable photos are
 # not rejected while obviously dark/blurry/noisy ones are sent back for retake.
 QUALITY_ACCEPT_SCORE: int = int(os.environ.get("QUALITY_ACCEPT_SCORE", "40"))
+QUALITY_MIN_COMPONENT_SCORE: int = int(os.environ.get("QUALITY_MIN_COMPONENT_SCORE", "20"))
 QUALITY_BRIGHTNESS_USABLE_MIN: float = 35.0
 QUALITY_BRIGHTNESS_IDEAL_MIN: float = 60.0
 QUALITY_BRIGHTNESS_IDEAL_MAX: float = 210.0
@@ -833,6 +834,19 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
     )))
     if contrast_component <= 0.0 and sharpness_component <= 0.0:
         quality_score = min(quality_score, QUALITY_ACCEPT_SCORE - 1)
+    brightness_score_100 = _score100(brightness_component)
+    contrast_score_100 = _score100(contrast_component)
+    sharpness_score_100 = _score100(sharpness_component)
+    noise_score_100 = _score100(noise_component)
+    component_pass = all(
+        score > QUALITY_MIN_COMPONENT_SCORE
+        for score in (
+            brightness_score_100,
+            contrast_score_100,
+            sharpness_score_100,
+            noise_score_100,
+        )
+    )
     advice = _quality_advice(
         brightness_mean=brightness_mean,
         contrast_component=contrast_component,
@@ -845,14 +859,15 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
         "contrast_std": contrast_std,
         "sharpness_score": sharpness_score,
         "noise_score": noise_score,
-        "brightness_score": _score100(brightness_component),
-        "contrast_score": _score100(contrast_component),
-        "sharpness_score_100": _score100(sharpness_component),
-        "noise_score_100": _score100(noise_component),
+        "brightness_score": brightness_score_100,
+        "contrast_score": contrast_score_100,
+        "sharpness_score_100": sharpness_score_100,
+        "noise_score_100": noise_score_100,
         "quality_score": quality_score,
         "quality_score_max": 100,
         "quality_accept_score": QUALITY_ACCEPT_SCORE,
-        "quality_pass": quality_score >= QUALITY_ACCEPT_SCORE,
+        "quality_min_component_score": QUALITY_MIN_COMPONENT_SCORE,
+        "quality_pass": quality_score >= QUALITY_ACCEPT_SCORE and component_pass,
         "quality_advice": advice,
     }
 
