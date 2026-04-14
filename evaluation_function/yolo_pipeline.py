@@ -71,6 +71,9 @@ ENABLE_ERROR_CHECKS: bool = True
 # not rejected while obviously dark/blurry/noisy ones are sent back for retake.
 QUALITY_ACCEPT_SCORE: int = int(os.environ.get("QUALITY_ACCEPT_SCORE", "40"))
 QUALITY_MIN_COMPONENT_SCORE: int = int(os.environ.get("QUALITY_MIN_COMPONENT_SCORE", "20"))
+QUALITY_MIN_SHARPNESS_SCORE: int = int(os.environ.get("QUALITY_MIN_SHARPNESS_SCORE", "10"))
+QUALITY_WARNING_COMPONENT_SCORE: int = int(os.environ.get("QUALITY_WARNING_COMPONENT_SCORE", "50"))
+QUALITY_WARNING_SHARPNESS_SCORE: int = int(os.environ.get("QUALITY_WARNING_SHARPNESS_SCORE", "25"))
 QUALITY_BRIGHTNESS_USABLE_MIN: float = 35.0
 QUALITY_BRIGHTNESS_IDEAL_MIN: float = 60.0
 QUALITY_BRIGHTNESS_IDEAL_MAX: float = 210.0
@@ -790,22 +793,22 @@ def _quality_advice(
 
     if brightness_score <= QUALITY_MIN_COMPONENT_SCORE:
         advice.append(brightness_fail)
-    elif brightness_score <= 50:
+    elif brightness_score <= QUALITY_WARNING_COMPONENT_SCORE:
         advice.append(brightness_warn)
 
     if contrast_score <= QUALITY_MIN_COMPONENT_SCORE:
         advice.append("The parts do not stand out clearly enough for reliable checking. Please retake the photo with a plain background and fewer shadows.")
-    elif contrast_score <= 50:
+    elif contrast_score <= QUALITY_WARNING_COMPONENT_SCORE:
         advice.append("The parts do not stand out very clearly. Use a plain background and avoid shadows next time.")
 
-    if sharpness_score <= QUALITY_MIN_COMPONENT_SCORE:
+    if sharpness_score <= QUALITY_MIN_SHARPNESS_SCORE:
         advice.append("The photo is too blurry for reliable checking. Please retake it after holding the camera still and refocusing.")
-    elif sharpness_score <= 50:
+    elif sharpness_score <= QUALITY_WARNING_SHARPNESS_SCORE:
         advice.append("The photo is a little blurry. For better results, hold the camera still and refocus next time.")
 
     if noise_score <= QUALITY_MIN_COMPONENT_SCORE:
         advice.append("The photo is too noisy or grainy for reliable checking. Please retake it with better lighting and avoid digital zoom.")
-    elif noise_score <= 50:
+    elif noise_score <= QUALITY_WARNING_COMPONENT_SCORE:
         advice.append("The photo looks a little noisy or grainy. Use better lighting and avoid digital zoom next time.")
 
     if not advice:
@@ -848,9 +851,9 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
     )
     quality_score = int(round(100.0 * (
         0.25 * brightness_component
-        + 0.20 * contrast_component
-        + 0.40 * sharpness_component
-        + 0.15 * noise_component
+        + 0.25 * contrast_component
+        + 0.25 * sharpness_component
+        + 0.25 * noise_component
     )))
     if contrast_component <= 0.0 and sharpness_component <= 0.0:
         quality_score = min(quality_score, QUALITY_ACCEPT_SCORE - 1)
@@ -858,14 +861,11 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
     contrast_score_100 = _score100(contrast_component)
     sharpness_score_100 = _score100(sharpness_component)
     noise_score_100 = _score100(noise_component)
-    component_pass = all(
-        score > QUALITY_MIN_COMPONENT_SCORE
-        for score in (
-            brightness_score_100,
-            contrast_score_100,
-            sharpness_score_100,
-            noise_score_100,
-        )
+    component_pass = (
+        brightness_score_100 > QUALITY_MIN_COMPONENT_SCORE
+        and contrast_score_100 > QUALITY_MIN_COMPONENT_SCORE
+        and sharpness_score_100 > QUALITY_MIN_SHARPNESS_SCORE
+        and noise_score_100 > QUALITY_MIN_COMPONENT_SCORE
     )
     advice = _quality_advice(
         brightness_mean=brightness_mean,
@@ -888,6 +888,9 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
         "quality_score_max": 100,
         "quality_accept_score": QUALITY_ACCEPT_SCORE,
         "quality_min_component_score": QUALITY_MIN_COMPONENT_SCORE,
+        "quality_min_sharpness_score": QUALITY_MIN_SHARPNESS_SCORE,
+        "quality_warning_component_score": QUALITY_WARNING_COMPONENT_SCORE,
+        "quality_warning_sharpness_score": QUALITY_WARNING_SHARPNESS_SCORE,
         "quality_pass": quality_score >= QUALITY_ACCEPT_SCORE and component_pass,
         "quality_advice": advice,
     }
