@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from lf_toolkit.evaluation import Params
-from .evaluation import evaluation_function
+from .evaluation import _build_student_message, evaluation_function
 from .yolo_pipeline import _quality_advice, compute_image_quality_metrics
 
 
@@ -192,6 +192,47 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertIn("little blurry", advice)
         self.assertIn("little noisy", advice)
         self.assertNotIn("retake", advice)
+
+    def test_spacer_feedback_reports_short_missing_from_counts(self):
+        is_correct, message = _build_student_message(
+            task="spacer",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"spacer_long": 1, "spacer_short": 0}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("short spacer", message.lower())
+
+    def test_spacer_feedback_reports_long_missing_from_counts(self):
+        is_correct, message = _build_student_message(
+            task="spacer",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"spacer_long": 0, "spacer_short": 1}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("long spacer", message.lower())
+
+    def test_spacer_feedback_reports_no_spacers_detected(self):
+        errors = [{"code": "E_SPACER_COUNT_MISMATCH", "message": "No spacers detected."}]
+
+        is_correct, message = _build_student_message(
+            task="spacer",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"spacer_long": 0, "spacer_short": 0}, "errors": errors},
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("no spacers", message.lower())
 
 
 if __name__ == "__main__":

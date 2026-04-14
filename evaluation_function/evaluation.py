@@ -109,6 +109,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     },
     "spacer": {
         "pass": "Good. The spacer setup looks correct.",
+        "none_detected": "No spacers were detected clearly. Please make sure both spacers are installed and clearly visible in the photo.",
         "short_missing": "The short spacer may be missing or not detected. Please check whether the short spacer is installed and retake the photo if needed.",
         "long_missing": "The long spacer may be missing or not detected. Please check whether the long spacer is installed and retake the photo if needed.",
         "count_fail": "A spacer may be missing or not detected. Please check whether both spacers are installed and retake the photo if needed.",
@@ -397,6 +398,8 @@ def _get_shaft_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
 
 def _get_spacer_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
     counts = out.get("spacer_counts", {}) if isinstance(out.get("spacer_counts"), dict) else {}
+    if not counts:
+        counts = out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
 
     n_long = _safe_int(counts.get("spacer_long", 0))
     n_short = _safe_int(counts.get("spacer_short", 0))
@@ -680,9 +683,18 @@ def _build_student_message(
         n_long, n_short, n_total = _get_spacer_counts(out)
         counts_dict = _get_counts_dict(out)
 
+        if "E_SPACER_SHORT_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["short_missing"]
+
+        if "E_SPACER_LONG_MISSING" in codes:
+            return False, MESSAGE_POLICY["spacer"]["long_missing"]
+
+        if "E_SPACER_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["spacer"]["type_confusion"]
+
         if ("spacer_long" in counts_dict) or ("spacer_short" in counts_dict):
             if n_total == 0:
-                return False, MESSAGE_POLICY["spacer"]["count_fail"]
+                return False, MESSAGE_POLICY["spacer"]["none_detected"]
 
             if n_short == 0 and n_long >= 1:
                 return False, MESSAGE_POLICY["spacer"]["short_missing"]
@@ -693,17 +705,10 @@ def _build_student_message(
             if n_short != 1 or n_long != 1 or n_total != 2:
                 return False, MESSAGE_POLICY["spacer"]["count_fail"]
 
-        if "E_SPACER_SHORT_MISSING" in codes:
-            return False, MESSAGE_POLICY["spacer"]["short_missing"]
-
-        if "E_SPACER_LONG_MISSING" in codes:
-            return False, MESSAGE_POLICY["spacer"]["long_missing"]
-
         if "E_SPACER_COUNT_MISMATCH" in codes:
+            if n_total == 0:
+                return False, MESSAGE_POLICY["spacer"]["none_detected"]
             return False, MESSAGE_POLICY["spacer"]["count_fail"]
-
-        if "E_SPACER_TYPE_CONFUSION" in codes:
-            return False, MESSAGE_POLICY["spacer"]["type_confusion"]
 
         if (
             "E_SPACER_ASSIGNMENT_FAIL" in codes
