@@ -764,29 +764,49 @@ def _score100(component: float) -> int:
 def _quality_advice(
     *,
     brightness_mean: float,
+    brightness_component: float,
     contrast_component: float,
     sharpness_component: float,
     noise_component: float,
 ) -> List[str]:
     advice: List[str] = []
 
-    if brightness_mean < QUALITY_BRIGHTNESS_USABLE_MIN:
-        advice.append("The photo is too dark. Retake it in brighter light.")
-    elif brightness_mean < QUALITY_BRIGHTNESS_IDEAL_MIN:
-        advice.append("The photo is a little dark. Add more light if possible.")
-    elif brightness_mean > QUALITY_BRIGHTNESS_USABLE_MAX:
-        advice.append("The photo is overexposed. Reduce glare or strong direct light.")
-    elif brightness_mean > QUALITY_BRIGHTNESS_IDEAL_MAX:
-        advice.append("The photo is a little bright. Try reducing glare.")
+    brightness_score = _score100(brightness_component)
+    contrast_score = _score100(contrast_component)
+    sharpness_score = _score100(sharpness_component)
+    noise_score = _score100(noise_component)
 
-    if contrast_component < 0.5:
-        advice.append("The parts do not stand out clearly. Use a plain background and avoid shadows.")
+    is_dark = brightness_mean < QUALITY_BRIGHTNESS_IDEAL_MIN
+    brightness_fail = (
+        "The photo is too dark for reliable checking. Please retake it in brighter light."
+        if is_dark
+        else "The photo is overexposed for reliable checking. Please retake it with less glare or strong direct light."
+    )
+    brightness_warn = (
+        "The photo is a little dark. Add more light next time if possible."
+        if is_dark
+        else "The photo is a little bright. Try reducing glare next time."
+    )
 
-    if sharpness_component < 0.5:
-        advice.append("The photo is blurry. Hold the camera still and refocus before taking the photo.")
+    if brightness_score <= QUALITY_MIN_COMPONENT_SCORE:
+        advice.append(brightness_fail)
+    elif brightness_score <= 50:
+        advice.append(brightness_warn)
 
-    if noise_component < 0.5:
-        advice.append("The photo looks noisy or grainy. Use better lighting and avoid digital zoom.")
+    if contrast_score <= QUALITY_MIN_COMPONENT_SCORE:
+        advice.append("The parts do not stand out clearly enough for reliable checking. Please retake the photo with a plain background and fewer shadows.")
+    elif contrast_score <= 50:
+        advice.append("The parts do not stand out very clearly. Use a plain background and avoid shadows next time.")
+
+    if sharpness_score <= QUALITY_MIN_COMPONENT_SCORE:
+        advice.append("The photo is too blurry for reliable checking. Please retake it after holding the camera still and refocusing.")
+    elif sharpness_score <= 50:
+        advice.append("The photo is a little blurry. For better results, hold the camera still and refocus next time.")
+
+    if noise_score <= QUALITY_MIN_COMPONENT_SCORE:
+        advice.append("The photo is too noisy or grainy for reliable checking. Please retake it with better lighting and avoid digital zoom.")
+    elif noise_score <= 50:
+        advice.append("The photo looks a little noisy or grainy. Use better lighting and avoid digital zoom next time.")
 
     if not advice:
         advice.append("The photo is clear enough for the next check.")
@@ -849,6 +869,7 @@ def compute_image_quality_metrics(img_bgr: np.ndarray) -> Dict[str, Any]:
     )
     advice = _quality_advice(
         brightness_mean=brightness_mean,
+        brightness_component=brightness_component,
         contrast_component=contrast_component,
         sharpness_component=sharpness_component,
         noise_component=noise_component,

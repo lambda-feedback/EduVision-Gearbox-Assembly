@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from lf_toolkit.evaluation import Params
 from .evaluation import evaluation_function
-from .yolo_pipeline import compute_image_quality_metrics
+from .yolo_pipeline import _quality_advice, compute_image_quality_metrics
 
 
 def _as_file_uri(path: str) -> str:
@@ -156,6 +156,39 @@ class TestEvaluationFunction(unittest.TestCase):
             quality["quality_min_component_score"],
         )
         self.assertFalse(quality["quality_pass"])
+
+    def test_image_quality_soft_warning_does_not_request_retake(self):
+        image = np.full((120, 160), 130, dtype=np.uint8)
+        for y in range(0, 120, 20):
+            image[y:y + 10, :] = 170
+        for x in range(0, 160, 20):
+            image[:, x:x + 10] = 90
+        image = cv2.GaussianBlur(image, (3, 3), 0)
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        quality = compute_image_quality_metrics(image)
+        advice = " ".join(quality["quality_advice"]).lower()
+
+        self.assertTrue(quality["quality_pass"])
+        self.assertGreater(quality["sharpness_score_100"], quality["quality_min_component_score"])
+        self.assertLessEqual(quality["sharpness_score_100"], 50)
+        self.assertIn("a little blurry", advice)
+        self.assertNotIn("retake", advice)
+
+    def test_quality_advice_soft_warnings_cover_all_components(self):
+        advice = " ".join(_quality_advice(
+            brightness_mean=50.0,
+            brightness_component=0.35,
+            contrast_component=0.35,
+            sharpness_component=0.35,
+            noise_component=0.35,
+        )).lower()
+
+        self.assertIn("little dark", advice)
+        self.assertIn("stand out", advice)
+        self.assertIn("little blurry", advice)
+        self.assertIn("little noisy", advice)
+        self.assertNotIn("retake", advice)
 
 
 if __name__ == "__main__":
