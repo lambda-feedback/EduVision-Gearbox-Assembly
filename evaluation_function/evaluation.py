@@ -130,7 +130,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "- driving gear: {driving_gear}\n"
             "- small gear: {smallgear}\n"
             "- big gear: {biggear}\n"
-            "Good. No obvious gear mismatch was detected."
+            "Good. No obvious gear mismesh was detected."
         ),
         "contact_consistency_fail": (
             "Detected gears:\n"
@@ -154,7 +154,7 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
             "- driving gear: {driving_gear}\n"
             "- small gear: {smallgear}\n"
             "- big gear: {biggear}\n"
-            "A gear mismatch was detected. Please adjust the gear positions so that the gears mesh correctly."
+            "A gear mismesh was detected. Please adjust the gear positions so that the gears mesh correctly."
         ),
         "no_gears": (
             "Detected gears:\n"
