@@ -6,7 +6,11 @@ import cv2
 import numpy as np
 from lf_toolkit.evaluation import Params
 from .evaluation import _build_student_message, evaluation_function
-from .yolo_pipeline import _quality_advice, compute_image_quality_metrics
+from .yolo_pipeline import (
+    _quality_advice,
+    compute_image_quality_metrics,
+    evaluate_spacer_step_errors,
+)
 
 
 def _as_file_uri(path: str) -> str:
@@ -234,6 +238,36 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertFalse(is_correct)
         self.assertIn("no spacers", message.lower())
 
+    def test_spacer_feedback_reports_too_many_spacers(self):
+        is_correct, message = _build_student_message(
+            task="spacer",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"spacer_long": 2, "spacer_short": 1}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("too many spacers", message.lower())
+
+    def test_spacer_assignment_feedback_mentions_placement_and_photo_quality(self):
+        errors = [{"code": "E_SPACER_ASSIGNMENT_FAIL", "message": "Assignment failed."}]
+
+        is_correct, message = _build_student_message(
+            task="spacer",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"spacer_long": 1, "spacer_short": 1}, "errors": errors},
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+        lower_message = message.lower()
+
+        self.assertFalse(is_correct)
+        self.assertIn("placed on the shafts", lower_message)
+        self.assertIn("clear top view", lower_message)
+
     def test_shaft_feedback_reports_short_shaft_missing_from_counts(self):
         is_correct, message = _build_student_message(
             task="shaft",
@@ -300,6 +334,40 @@ class TestEvaluationFunction(unittest.TestCase):
 
         self.assertFalse(is_correct)
         self.assertIn("too many shafts", message.lower())
+
+    def test_spacer_assignment_checked_before_distance_order(self):
+        errors = evaluate_spacer_step_errors(
+            gears=[{"gid": 11, "center": (0.0, 0.0), "r": 10.0}],
+            shafts=[
+                {"center": (10.0, 0.0), "major_len": 40.0},
+                {"center": (30.0, 0.0), "major_len": 40.0},
+            ],
+            spacers=[
+                {"sid": 1, "cls": "short_spacer", "center": (100.0, 0.0)},
+                {"sid": 2, "cls": "long_spacer", "center": (5.0, 0.0)},
+            ],
+            gear11_gid=11,
+            spacer_to_si={2: 1},
+        )
+
+        self.assertEqual(errors[0]["code"], "E_SPACER_ASSIGNMENT_FAIL")
+
+    def test_spacer_position_checked_before_distance_order(self):
+        errors = evaluate_spacer_step_errors(
+            gears=[{"gid": 11, "center": (0.0, 0.0), "r": 10.0}],
+            shafts=[
+                {"center": (10.0, 0.0), "major_len": 40.0},
+                {"center": (30.0, 0.0), "major_len": 40.0},
+            ],
+            spacers=[
+                {"sid": 1, "cls": "short_spacer", "center": (100.0, 0.0)},
+                {"sid": 2, "cls": "long_spacer", "center": (5.0, 0.0)},
+            ],
+            gear11_gid=11,
+            spacer_to_si={1: 1, 2: 0},
+        )
+
+        self.assertEqual(errors[0]["code"], "E_SPACER_POSITION_MISMATCH")
 
 
 if __name__ == "__main__":

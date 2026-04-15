@@ -1298,18 +1298,6 @@ def evaluate_spacer_step_errors(
     short_sp = short_spacers[0]
     long_sp = long_spacers[0]
 
-    # Strong direct geometric rule first
-    d_short = center_dist(short_sp["center"], c11)
-    d_long = center_dist(long_sp["center"], c11)
-    tol_px = relative_spacer_distance_tol(shafts, gears)
-
-    if d_short > d_long + tol_px:
-        errs.append({
-            "code": "E_SPACER_DISTANCE_ORDER",
-            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={tol_px:.1f}px)."
-        })
-        return errs
-
     shaft2_idx, shaft3_idx = get_expected_shaft_indices_for_step(
         gears=gears,
         shafts=shafts,
@@ -1351,6 +1339,17 @@ def evaluate_spacer_step_errors(
         errs.append({
             "code": "E_SPACER3_TYPE_MISMATCH",
             "message": "The spacer on shaft3 is not the long spacer."
+        })
+        return errs
+
+    d_short = center_dist(short_sp["center"], c11)
+    d_long = center_dist(long_sp["center"], c11)
+    tol_px = relative_spacer_distance_tol(shafts, gears)
+
+    if d_short > d_long + tol_px:
+        errs.append({
+            "code": "E_SPACER_DISTANCE_ORDER",
+            "message": f"The short spacer is not closer to gear11 than the long spacer (tol={tol_px:.1f}px)."
         })
         return errs
 

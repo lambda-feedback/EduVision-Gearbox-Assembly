@@ -116,9 +116,10 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
         "none_detected": "No spacers were detected clearly. Please make sure both spacers are installed and clearly visible in the photo.",
         "short_missing": "The short spacer may be missing or not detected. Please check whether the short spacer is installed and retake the photo if needed.",
         "long_missing": "The long spacer may be missing or not detected. Please check whether the long spacer is installed and retake the photo if needed.",
+        "too_many": "Too many spacers were detected. Please make sure only the required short spacer and long spacer are visible in the photo.",
         "count_fail": "A spacer may be missing or not detected. Please check whether both spacers are installed and retake the photo if needed.",
         "type_confusion": "The spacer types could not be identified reliably. Please retake the photo from a clearer angle and make sure both spacers are fully visible.",
-        "assignment_fail": "The spacers were detected, but at least one spacer could not be reliably assigned to a shaft. Please make sure both spacers are correctly installed on the shafts and retake the photo from a clear top view.",
+        "assignment_fail": "The spacers were detected, but at least one spacer could not be reliably assigned to a shaft. Please make sure both spacers are placed on the shafts. If they are already on the shafts, retake the photo from a clear top view with both shafts and spacers fully visible.",
         "position_mismatch": "The spacer positions appear to be incorrect. Please make sure the short spacer is on the short shaft and the long spacer is on the long shaft.",
         "distance_order": "The spacer order appears to be incorrect. Please check whether the short spacer is closer to white gear than the long spacer.",
         "fail": "Please check the spacer setup again.",
@@ -719,6 +720,9 @@ def _build_student_message(
             if n_total == 0:
                 return False, MESSAGE_POLICY["spacer"]["none_detected"]
 
+            if n_total > 2:
+                return False, MESSAGE_POLICY["spacer"]["too_many"]
+
             if n_short == 0 and n_long >= 1:
                 return False, MESSAGE_POLICY["spacer"]["short_missing"]
 
@@ -731,6 +735,8 @@ def _build_student_message(
         if "E_SPACER_COUNT_MISMATCH" in codes:
             if n_total == 0:
                 return False, MESSAGE_POLICY["spacer"]["none_detected"]
+            if n_total > 2:
+                return False, MESSAGE_POLICY["spacer"]["too_many"]
             return False, MESSAGE_POLICY["spacer"]["count_fail"]
 
         if (
