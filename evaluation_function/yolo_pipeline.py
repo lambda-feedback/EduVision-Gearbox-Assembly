@@ -1159,8 +1159,11 @@ def evaluate_shaft_step_errors(
         errs.append({"code": "E_NO_GEARS", "message": "No gears detected."})
         return errs
 
-    if len(shafts) == 0:
-        errs.append({"code": "E_SHAFT_COUNT_MISMATCH", "message": "No shafts detected."})
+    if len(shafts) != 2:
+        errs.append({
+            "code": "E_SHAFT_COUNT_MISMATCH",
+            "message": f"Expected 2 shafts, but detected {len(shafts)}.",
+        })
         return errs
 
     g11 = next((g for g in gears if g["gid"] == gear11_gid), None)

@@ -102,6 +102,10 @@ MESSAGE_POLICY: Dict[str, Dict[str, str]] = {
     },
     "shaft": {
         "pass": "Good. The shaft setup looks correct.",
+        "none_detected": "No shafts were detected clearly. Please make sure one short shaft and one long shaft are installed and clearly visible in the photo.",
+        "short_missing": "The short shaft may be missing or not detected. Please check whether the short shaft is installed and clearly visible in the photo.",
+        "long_missing": "The long shaft may be missing or not detected. Please check whether the long shaft is installed and clearly visible in the photo.",
+        "too_many": "Too many shafts were detected. Please make sure only the required short shaft and long shaft are visible in the photo.",
         "count_fail": "A shaft may be missing or not detected. Please check whether both shafts are installed and retake the photo if needed.",
         "type_confusion": "The shaft types could not be identified reliably. Please retake the photo from a clearer angle and make sure both shafts are fully visible.",
         "position_swap": "The shaft positions appear to be incorrect. Please make sure the short shaft is closer to the white gear and the long shaft is farther away.",
@@ -388,6 +392,8 @@ def _get_gear_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
 
 def _get_shaft_counts(out: Dict[str, Any]) -> Tuple[int, int, int]:
     counts = out.get("shaft_counts", {}) if isinstance(out.get("shaft_counts"), dict) else {}
+    if not counts:
+        counts = out.get("counts", {}) if isinstance(out.get("counts"), dict) else {}
 
     n_long = _safe_int(counts.get("shaft_long", 0))
     n_short = _safe_int(counts.get("shaft_short", 0))
@@ -645,6 +651,15 @@ def _build_student_message(
         n_long, n_short, n_total = _get_shaft_counts(out)
 
         if n_total > 0:
+            if n_total > 2:
+                return False, MESSAGE_POLICY["shaft"]["too_many"]
+
+            if n_total == 1 and n_long == 1 and n_short == 0:
+                return False, MESSAGE_POLICY["shaft"]["short_missing"]
+
+            if n_total == 1 and n_short == 1 and n_long == 0:
+                return False, MESSAGE_POLICY["shaft"]["long_missing"]
+
             if n_total != 2:
                 return False, MESSAGE_POLICY["shaft"]["count_fail"]
 
@@ -656,6 +671,14 @@ def _build_student_message(
             or "E_NO_SHAFTS" in codes
             or "E_SHAFT2_NOT_FOUND" in codes
         ):
+            if n_total == 0:
+                return False, MESSAGE_POLICY["shaft"]["none_detected"]
+            if n_total > 2:
+                return False, MESSAGE_POLICY["shaft"]["too_many"]
+            if n_total == 1 and n_long == 1 and n_short == 0:
+                return False, MESSAGE_POLICY["shaft"]["short_missing"]
+            if n_total == 1 and n_short == 1 and n_long == 0:
+                return False, MESSAGE_POLICY["shaft"]["long_missing"]
             return False, MESSAGE_POLICY["shaft"]["count_fail"]
 
         if (

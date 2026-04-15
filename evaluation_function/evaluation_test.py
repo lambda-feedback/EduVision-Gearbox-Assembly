@@ -234,6 +234,73 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertFalse(is_correct)
         self.assertIn("no spacers", message.lower())
 
+    def test_shaft_feedback_reports_short_shaft_missing_from_counts(self):
+        is_correct, message = _build_student_message(
+            task="shaft",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"shaft_long": 1, "shaft_short": 0}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("short shaft", message.lower())
+
+    def test_shaft_feedback_reports_long_shaft_missing_from_counts(self):
+        is_correct, message = _build_student_message(
+            task="shaft",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"shaft_long": 0, "shaft_short": 1}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("long shaft", message.lower())
+
+    def test_shaft_feedback_reports_no_shafts_detected(self):
+        errors = [{"code": "E_SHAFT_COUNT_MISMATCH", "message": "No shafts detected."}]
+
+        is_correct, message = _build_student_message(
+            task="shaft",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"shaft_long": 0, "shaft_short": 0}, "errors": errors},
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("no shafts", message.lower())
+
+    def test_shaft_feedback_reports_type_confusion_for_wrong_types(self):
+        is_correct, message = _build_student_message(
+            task="shaft",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"shaft_long": 2, "shaft_short": 0}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("shaft types", message.lower())
+
+    def test_shaft_feedback_reports_too_many_shafts(self):
+        is_correct, message = _build_student_message(
+            task="shaft",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"counts": {"shaft_long": 2, "shaft_short": 1}},
+            errors=[],
+            selected_errors=[],
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("too many shafts", message.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
