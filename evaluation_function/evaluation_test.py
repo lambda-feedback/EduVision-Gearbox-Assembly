@@ -369,6 +369,59 @@ class TestEvaluationFunction(unittest.TestCase):
 
         self.assertEqual(errors[0]["code"], "E_SPACER_POSITION_MISMATCH")
 
+    def test_mesh_ratio_uses_specific_shaft_count_feedback(self):
+        errors = [{"code": "E_SHAFT_COUNT_MISMATCH", "message": "Expected 2 shafts."}]
+
+        is_correct, message = _build_student_message(
+            task="mesh_ratio",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"shaft_counts": {"shaft_long": 1, "shaft_short": 0}, "errors": errors},
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("short shaft", message.lower())
+
+    def test_mesh_ratio_uses_specific_spacer_count_feedback(self):
+        errors = [{"code": "E_SPACER_COUNT_MISMATCH", "message": "Expected 2 spacers."}]
+
+        is_correct, message = _build_student_message(
+            task="mesh_ratio",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={"spacer_counts": {"spacer_long": 2, "spacer_short": 1}, "errors": errors},
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("too many spacers", message.lower())
+
+    def test_mesh_ratio_prioritizes_shaft_before_spacer(self):
+        errors = [
+            {"code": "E_SHAFT_COUNT_MISMATCH", "message": "Expected 2 shafts."},
+            {"code": "E_SPACER_COUNT_MISMATCH", "message": "Expected 2 spacers."},
+        ]
+
+        is_correct, message = _build_student_message(
+            task="mesh_ratio",
+            img_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            out={
+                "shaft_counts": {"shaft_long": 1, "shaft_short": 0},
+                "spacer_counts": {"spacer_long": 2, "spacer_short": 1},
+                "errors": errors,
+            },
+            errors=errors,
+            selected_errors=errors,
+            part_type="",
+        )
+
+        self.assertFalse(is_correct)
+        self.assertIn("short shaft", message.lower())
+        self.assertNotIn("too many spacers", message.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

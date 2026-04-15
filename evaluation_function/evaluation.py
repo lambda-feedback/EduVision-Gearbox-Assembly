@@ -817,13 +817,48 @@ def _build_student_message(
             for e in selected_errors
             if isinstance(e, dict)
         }
+        driving_gear, smallgear, biggear = _get_gear_counts(out)
+        shaft_long, shaft_short, shaft_total = _get_shaft_counts(out)
+        spacer_long, spacer_short, spacer_total = _get_spacer_counts(out)
 
         # Highest-priority prerequisite errors
         if "E_NO_GEARS" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["no_gears"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if "E_NO_SHAFTS" in codes:
+            return False, MESSAGE_POLICY["shaft"]["none_detected"]
+
+        if "E_NO_GEAR11" in codes:
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
 
-        if "E_NO_SHAFTS" in codes or "E_NO_GEAR11" in codes:
-            return False, MESSAGE_POLICY["mesh_ratio"]["fail"]
+        # Shaft checks
+        if (
+            "E_SHAFT_COUNT_MISMATCH" in codes
+            or "E_SHAFT2_NOT_FOUND" in codes
+        ):
+            if shaft_total == 0:
+                return False, MESSAGE_POLICY["shaft"]["none_detected"]
+            if shaft_total > 2:
+                return False, MESSAGE_POLICY["shaft"]["too_many"]
+            if shaft_total == 1 and shaft_long == 1 and shaft_short == 0:
+                return False, MESSAGE_POLICY["shaft"]["short_missing"]
+            if shaft_total == 1 and shaft_short == 1 and shaft_long == 0:
+                return False, MESSAGE_POLICY["shaft"]["long_missing"]
+            return False, MESSAGE_POLICY["shaft"]["count_fail"]
+
+        if "E_SHAFT_TYPE_CONFUSION" in codes:
+            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
+
+        if (
+            "E_SHAFT_POSITION_SWAP" in codes
+            or "E_SHAFT2_CLASS_MISMATCH" in codes
+            or "E_SHAFT3_CLASS_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["shaft"]["position_swap"]
 
         # Spacer checks
         if "E_SPACER_SHORT_MISSING" in codes:
@@ -832,11 +867,15 @@ def _build_student_message(
         if "E_SPACER_LONG_MISSING" in codes:
             return False, MESSAGE_POLICY["spacer"]["long_missing"]
 
-        if "E_SPACER_COUNT_MISMATCH" in codes:
-            return False, MESSAGE_POLICY["spacer"]["count_fail"]
-
         if "E_SPACER_TYPE_CONFUSION" in codes:
             return False, MESSAGE_POLICY["spacer"]["type_confusion"]
+
+        if "E_SPACER_COUNT_MISMATCH" in codes:
+            if spacer_total == 0:
+                return False, MESSAGE_POLICY["spacer"]["none_detected"]
+            if spacer_total > 2:
+                return False, MESSAGE_POLICY["spacer"]["too_many"]
+            return False, MESSAGE_POLICY["spacer"]["count_fail"]
 
         if (
             "E_SPACER_ASSIGNMENT_FAIL" in codes
@@ -855,28 +894,33 @@ def _build_student_message(
         if "E_SPACER_DISTANCE_ORDER" in codes:
             return False, MESSAGE_POLICY["spacer"]["distance_order"]
 
-        # Shaft checks
-        if (
-            "E_SHAFT_POSITION_SWAP" in codes
-            or "E_SHAFT2_CLASS_MISMATCH" in codes
-            or "E_SHAFT3_CLASS_MISMATCH" in codes
-        ):
-            return False, MESSAGE_POLICY["shaft"]["position_swap"]
-
-        if (
-            "E_SHAFT_COUNT_MISMATCH" in codes
-            or "E_SHAFT2_NOT_FOUND" in codes
-        ):
-            return False, MESSAGE_POLICY["shaft"]["count_fail"]
-
-        if "E_SHAFT_TYPE_CONFUSION" in codes:
-            return False, MESSAGE_POLICY["shaft"]["type_confusion"]
-
         # Mesh and consistency checks
+        if "E_GEAR_BIG_SMALL_INCONSISTENT" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["big_small_inconsistent"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if "E_GEAR_CONTACT_INCONSISTENT" in codes:
+            return False, MESSAGE_POLICY["gear_inventory"]["contact_consistency_fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
         if (
             "E_MISMESH_DETECTED" in codes
             or "E_MESH_MISMATCH" in codes
-            or "E_CONTACT_COUNT_MISMATCH" in codes
+        ):
+            return False, MESSAGE_POLICY["gear_inventory"]["mismatch_fail"].format(
+                driving_gear=driving_gear,
+                smallgear=smallgear,
+                biggear=biggear,
+            )
+
+        if (
+            "E_CONTACT_COUNT_MISMATCH" in codes
             or "E_GEAR_COUNT_UNSUPPORTED" in codes
         ):
             return False, MESSAGE_POLICY["mesh_ratio"]["fail"]

@@ -2663,18 +2663,47 @@ def run_yolo_pipeline(
             gears, spacers, shaft_obbs
         )
 
+    shaft_counts = get_shaft_counts(shaft_obbs)
+    spacer_counts = get_spacer_counts(spacers)
+
     errors: List[Dict[str, str]] = []
-    if ENABLE_ERROR_CHECKS and shaft_obbs:
-        errors = evaluate_assembly_errors(
-            gears=gears,
-            spacers=spacers,
-            shafts=shaft_obbs,
-            mesh_boxes=mesh_boxes,
-            mismesh_boxes=mismesh_boxes,
-            gear11_gid=int(gear11_gid),
-            gear_to_si=gear_to_si,
-            spacer_to_si=spacer_to_si,
-        )
+    if ENABLE_ERROR_CHECKS:
+        if not shaft_obbs:
+            errors = [{"code": "E_NO_SHAFTS", "message": "No shafts detected."}]
+        else:
+            errors = evaluate_shaft_step_errors(
+                gears=gears,
+                shafts=shaft_obbs,
+                gear11_gid=int(gear11_gid),
+            )
+
+        if not errors:
+            errors = evaluate_spacer_step_errors(
+                gears=gears,
+                spacers=spacers,
+                shafts=shaft_obbs,
+                gear11_gid=int(gear11_gid),
+                spacer_to_si=spacer_to_si,
+            )
+
+        if not errors:
+            errors, _gear_counts = evaluate_gear_inventory_step(
+                gears=gears,
+                mesh_boxes=mesh_boxes,
+                mismesh_boxes=mismesh_boxes,
+            )
+
+        if not errors:
+            errors = evaluate_assembly_errors(
+                gears=gears,
+                spacers=spacers,
+                shafts=shaft_obbs,
+                mesh_boxes=mesh_boxes,
+                mismesh_boxes=mismesh_boxes,
+                gear11_gid=int(gear11_gid),
+                gear_to_si=gear_to_si,
+                spacer_to_si=spacer_to_si,
+            )
 
     gear_names, gear_stage, chain_pairs = stage_role_naming_chain(
         gears=gears,
@@ -2703,6 +2732,8 @@ def run_yolo_pipeline(
             "stages": num_stages,
         },
         "counts": get_gear_counts(gears),
+        "shaft_counts": shaft_counts,
+        "spacer_counts": spacer_counts,
         "detections": {
             "gear_dets": gear_dets,
             "aux_dets": aux_dets,
