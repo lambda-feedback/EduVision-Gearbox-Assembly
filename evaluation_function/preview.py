@@ -24,7 +24,5 @@ def preview_function(response: Any, params: Params) -> Result:
 
     try:
         return Result(preview=Preview(sympy=response))
-    except FeedbackException as e:
-        return Result(preview=Preview(feedback=str(e)))
     except Exception as e:
         return Result(preview=Preview(feedback=str(e)))
