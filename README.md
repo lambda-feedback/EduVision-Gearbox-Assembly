@@ -2,6 +2,9 @@
 
 This repository contains the boilerplate code needed to create a containerized evaluation function written in Python.
 
+## Deployment
+[![Create Release Request](https://img.shields.io/badge/Create%20Release%20Request-blue?style=for-the-badge)](https://github.com/lambda-feedback/EduVision-Gearbox-Assembly/issues/new?template=release-request.yml)
+
 ## Quickstart
 
 This chapter helps you to quickly set up a new Python evaluation function using this template repository.
