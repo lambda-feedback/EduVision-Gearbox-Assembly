@@ -20,7 +20,7 @@ SAVE_ROOT = r"C:\Users\sheng\Desktop\Pipeline_saved_results"
 
 # ---- task controls ----
 TASK = "full"  # "parts_inventory" | "shaft" | "spacer" | "gear_inventory" | "mesh_ratio" | "full"
-#PART_TYPE = "gear"  # "gear" | "shaft" | "spacer" (only used when TASK=="parts_inventory")
+PART_TYPE = "gear"  # "gear" | "shaft" | "spacer" (only used when TASK=="parts_inventory")
 EXPECTED_GEARS = None
 RUN_ALL_TASKS = False
 
